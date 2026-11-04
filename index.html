@@ -421,7 +421,7 @@ button.bcard:hover { background: var(--surface-2); }
   var KEY_TERAKHIR = 'bukutitip.cadangan.terakhir';
   var KEY_CFG = 'bukutitip.sync.cfg';
   var KEY_OUT = 'bukutitip.sync.outbox';
-  var COLL = ['warung', 'hpp', 'titipan', 'pengeluaran'];
+  var COLL = ['warung', 'hpp', 'titipan', 'pengeluaran', 'karyawan'];
   var store = {};
   var listeners = {};
   COLL.forEach(function (c) { store[c] = {}; listeners[c] = []; });
@@ -486,12 +486,18 @@ button.bcard:hover { background: var(--surface-2); }
   function saveCfg() { if (cfg) lsSet(KEY_CFG, JSON.stringify(cfg)); else lsDel(KEY_CFG); }
   function saveOut() { if (outbox.length) lsSet(KEY_OUT, JSON.stringify(outbox)); else lsDel(KEY_OUT); }
   function emit() {
-    var key = state + '|' + outbox.length + '|' + detail + '|' + (cfg ? '1' : '0');
+    var key = state + '|' + outbox.length + '|' + detail + '|' + (cfg ? '1' : '0') + '|' + (cfg && cfg.peran || '') + '|' + (cfg && cfg.aku ? cfg.aku.id + ':' + cfg.aku.komisi : '');
     if (key === lastKey) return;
     lastKey = key;
     if (api && typeof api.onStatus === 'function') api.onStatus();
   }
   function setState(s, d) { state = s; detail = d || ''; emit(); }
+  function ambilPeran(res) {
+    if (!cfg || !res) return;
+    var p = res.peran === 'sales' ? 'sales' : 'pemilik';
+    var a = p === 'sales' && res.aku ? { id: String(res.aku.id), nama: String(res.aku.nama || ''), komisi: Number(res.aku.komisi) || 0 } : null;
+    if (cfg.peran !== p || sig(cfg.aku || null) !== sig(a)) { cfg.peran = p; cfg.aku = a; saveCfg(); emit(); }
+  }
   function pending(c, id) { return outbox.some(function (o) { return o.c === c && o.id === id; }); }
 
   function enqueueMany(list) {
@@ -562,7 +568,7 @@ button.bcard:hover { background: var(--surface-2); }
     if (state !== 'ok') setState('sync');
     var sent = outbox.slice(0, 100);
     var first = !cfg.lastTs;
-    var body = { a: 'sync', since: first ? 0 : Math.max(0, cfg.lastTs - 120000), ops: sent.map(function (o) { return { c: o.c, id: o.id, op: o.op, data: o.data }; }) };
+    var body = { a: 'sync', since: (first || cfg.full) ? 0 : Math.max(0, cfg.lastTs - 120000), ops: sent.map(function (o) { return { c: o.c, id: o.id, op: o.op, data: o.data }; }) };
     return post(body).then(function (res) {
       var sentSeq = {};
       sent.forEach(function (o) { sentSeq[o.c + '/' + o.id] = o.seq; });
@@ -570,7 +576,16 @@ button.bcard:hover { background: var(--surface-2); }
       var serverKeys = {};
       var touched = terapkanDariServer(res.docs || [], serverKeys);
       var lagi = false;
-      if (first) {
+      ambilPeran(res);
+      var ditolak = 0;
+      if (res.tolak && res.tolak.length) {
+        // Server menolak sebagian catatan (misalnya nama warung sudah ada): buang dari HP ini dan tarik ulang semuanya
+        res.tolak.forEach(function (x) {
+          if (store[x.c] && Object.prototype.hasOwnProperty.call(store[x.c], x.id) && !pending(x.c, x.id)) { delete store[x.c][x.id]; touched[x.c] = 1; ditolak++; }
+        });
+        cfg.full = true;
+      } else { cfg.full = false; }
+      if (first && cfg.peran !== 'sales') {
         // Sambungan pertama: data yang hanya ada di HP ini ikut dikirim ke Sheet
         var naik = [];
         COLL.forEach(function (c) {
@@ -585,7 +600,8 @@ button.bcard:hover { background: var(--surface-2); }
       Object.keys(touched).forEach(notify);
       busy = false; failCount = 0; nextTry = 0; lastOk = Date.now();
       setState('ok');
-      if (outbox.length) scheduleFlush(lagi ? 50 : 300);
+      if (ditolak && api && typeof api.onNotice === 'function') api.onNotice('Server menolak ' + ditolak + ' catatan. Kemungkinan nama warung sudah ada atau tidak diizinkan untuk sales.');
+      if (outbox.length || cfg.full) scheduleFlush(lagi ? 50 : 300);
     }, function (err) { busy = false; gagal(err); });
   }
 
@@ -597,6 +613,7 @@ button.bcard:hover { background: var(--surface-2); }
     busy = true;
     post({ a: 'ver' }).then(function (res) {
       busy = false; failCount = 0; lastOk = Date.now();
+      ambilPeran(res);
       if (res.ver !== cfg.lastVer) syncOnce();
       else if (state !== 'ok') setState('ok');
     }, function (err) { busy = false; gagal(err); });
@@ -609,8 +626,9 @@ button.bcard:hover { background: var(--surface-2); }
     k = String(k || '').trim();
     if (!/^https:\/\/script\.google\.com\/.+\/exec$/.test(u)) return Promise.reject(new Error('Alamat web app harus diawali https://script.google.com/ dan berakhiran /exec.'));
     if (!k) return Promise.reject(new Error('Isi kode akses.'));
-    return post({ a: 'ping' }, { u: u, k: k }).then(function () {
-      cfg = { u: u, k: k, lastTs: 0 };
+    return post({ a: 'ping' }, { u: u, k: k }).then(function (pr) {
+      cfg = { u: u, k: k, lastTs: 0, peran: pr.peran === 'sales' ? 'sales' : 'pemilik', aku: null };
+      if (cfg.peran === 'sales' && pr.aku) cfg.aku = { id: String(pr.aku.id), nama: String(pr.aku.nama || ''), komisi: Number(pr.aku.komisi) || 0 };
       outbox = []; saveOut(); saveCfg();
       failCount = 0; nextTry = 0; busy = false;
       setState('sync'); startLoop();
@@ -625,8 +643,12 @@ button.bcard:hover { background: var(--surface-2); }
 
   function b64(s) { return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
   function unb64(s) { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return decodeURIComponent(escape(atob(s))); }
-  function kodePasang() { return cfg ? 'bt1.' + b64(JSON.stringify({ u: cfg.u, k: cfg.k })) : ''; }
-  function tautanPasang() { return cfg ? location.origin + location.pathname + '#pasang=' + kodePasang() : ''; }
+  function kodePasangUntuk(kode) { return cfg && kode ? 'bt1.' + b64(JSON.stringify({ u: cfg.u, k: String(kode) })) : ''; }
+  function tautanPasangUntuk(kode) { return cfg && kode ? location.origin + location.pathname + '#pasang=' + kodePasangUntuk(kode) : ''; }
+  function kodePasang() { return cfg ? kodePasangUntuk(cfg.k) : ''; }
+  function tautanPasang() { return cfg ? tautanPasangUntuk(cfg.k) : ''; }
+  function peran() { return cfg && cfg.peran === 'sales' ? 'sales' : 'pemilik'; }
+  function aku() { return cfg && cfg.aku ? { id: cfg.aku.id, nama: cfg.aku.nama, komisi: cfg.aku.komisi } : null; }
   function bacaPasang(text) {
     try {
       var t = String(text || '').trim();
@@ -756,6 +778,7 @@ button.bcard:hover { background: var(--surface-2); }
     COLL.forEach(function (c) {
       out[c] = {};
       var col = src[c];
+      if (c === 'karyawan' && col === undefined) { out[c] = null; return; } // cadangan lama: daftar sales tidak disentuh
       if (col && typeof col === 'object' && !Array.isArray(col)) {
         Object.keys(col).forEach(function (id) {
           if (col[id] && typeof col[id] === 'object') { out[c][id] = col[id]; any = true; }
@@ -769,7 +792,7 @@ button.bcard:hover { background: var(--surface-2); }
     lsSet(KEY + '.sebelum-pulih', JSON.stringify(store)); // jaring pengaman
     var prev = store;
     store = {};
-    COLL.forEach(function (c) { store[c] = clone(data[c]); });
+    COLL.forEach(function (c) { store[c] = data[c] === null ? clone(prev[c] || {}) : clone(data[c]); });
     if (!save()) { store = prev; return false; }
     if (cfg) {
       var list = [];
@@ -840,7 +863,7 @@ button.bcard:hover { background: var(--surface-2); }
         });
       } }, 'Pasang');
       sec.appendChild(h('div', { class: 'box', style: 'margin-top:12px;display:flex;flex-direction:column;gap:12px' },
-        h('h3', null, 'Karyawan: tempel kode pasang dari pemilik'),
+        h('h3', null, 'Admin atau sales: tempel kode pasang dari pemilik'),
         fieldBox(h, 'Kode pasang', inP),
         h('div', { class: 'hero-actions', style: 'margin-top:0' }, bPas)));
       sec.appendChild(err);
@@ -865,8 +888,8 @@ button.bcard:hover { background: var(--surface-2); }
       bSync.disabled = true; bSync.textContent = 'Menyinkronkan…';
       syncOnce().then(function () { bSync.disabled = false; bSync.textContent = 'Sinkron sekarang'; });
     } }, 'Sinkron sekarang');
-    var bSalin = h('button', { type: 'button', class: 'btn', onclick: function () { salin(kode, toast, 'Kode pasang disalin. Kirim hanya ke karyawan yang dipercaya.', kodeBox); } }, 'Salin kode pasang');
-    var bTaut = h('button', { type: 'button', class: 'btn', onclick: function () { salin(tautanPasang(), toast, 'Tautan pasang disalin.', kodeBox); } }, 'Salin tautan pasang');
+    var bSalin = h('button', { type: 'button', class: 'btn', onclick: function () { salin(kode, toast, 'Kode pasang disalin. Kirim hanya ke admin yang dipercaya.', kodeBox); } }, 'Salin kode admin');
+    var bTaut = h('button', { type: 'button', class: 'btn', onclick: function () { salin(tautanPasang(), toast, 'Tautan pasang disalin.', kodeBox); } }, 'Salin tautan admin');
     var armed = false, tm = 0;
     var bPut = h('button', { type: 'button', class: 'btn danger', onclick: function () {
       if (!armed) {
@@ -878,8 +901,8 @@ button.bcard:hover { background: var(--surface-2); }
     } }, 'Putuskan sambungan');
     sec.appendChild(h('div', { class: 'hero-actions' }, bSync, bSalin, bTaut));
     sec.appendChild(h('div', { class: 'box', style: 'margin-top:12px' },
-      h('h3', null, 'Kode pasang untuk karyawan'),
-      h('p', { class: 'note' }, 'Karyawan memasang aplikasi ke layar utama, buka menu Laporan, lalu tempel kode ini di bagian "Karyawan". Kode berisi kunci akses ke datamu, jadi kirim hanya ke orang yang dipercaya.'),
+      h('h3', null, 'Kode pasang pemilik atau admin'),
+      h('p', { class: 'note' }, 'Pakai kode ini untuk HP-mu yang lain atau untuk admin yang menukar rencengan. Pemegang kode ini melihat semua data, termasuk laba dan biaya. Untuk sales, buat kode terpisah per orang di bagian "Sales dan komisi" di bawah.'),
       h('div', { style: 'margin-top:8px' }, kodeBox)));
     sec.appendChild(h('div', { class: 'hero-actions' }, bPut));
     sec.appendChild(err);
@@ -954,6 +977,36 @@ button.bcard:hover { background: var(--surface-2); }
     return sec;
   }
 
+  function salesCard(h, toast) {
+    var sec = h('section', { class: 'card', 'aria-label': 'Sinkron data' });
+    sec.appendChild(h('div', { class: 'card-title' }, 'Sinkron data'));
+    var st = status();
+    var teks = st ? st.text : 'Belum tersambung';
+    if (state === 'ok' && !outbox.length) teks = 'Tersinkron' + (lastOk ? ' (' + jam(lastOk) + ')' : '');
+    var line = h('p', { class: 'note', style: 'margin-top:10px' }, h('b', null, teks));
+    if (detail && state !== 'ok') line.appendChild(document.createTextNode('. ' + detail));
+    if (outbox.length) line.appendChild(document.createTextNode('. ' + outbox.length + ' perubahan menunggu dikirim.'));
+    sec.appendChild(line);
+    sec.appendChild(h('div', { class: 'card-sub' }, 'Terhubung sebagai sales. Catatanmu dikirim otomatis ke pemilik. Tanpa sinyal, catatan antre dan terkirim saat online. Menukar rencengan dikerjakan admin atau pemilik.'));
+    var bSync = h('button', { type: 'button', class: 'btn primary', onclick: function () {
+      cfg.stop = false; saveCfg(); nextTry = 0; failCount = 0; startLoop();
+      bSync.disabled = true; bSync.textContent = 'Menyinkronkan…';
+      syncOnce().then(function () { bSync.disabled = false; bSync.textContent = 'Sinkron sekarang'; });
+    } }, 'Sinkron sekarang');
+    var armed = false, tm = 0;
+    var bPut = h('button', { type: 'button', class: 'btn danger', onclick: function () {
+      if (!armed) {
+        armed = true; bPut.textContent = 'Ketuk lagi untuk memutuskan';
+        tm = setTimeout(function () { armed = false; bPut.textContent = 'Putuskan sambungan'; }, 4000);
+        return;
+      }
+      clearTimeout(tm); putuskan(); toast('Sambungan diputus.');
+    } }, 'Putuskan sambungan');
+    sec.appendChild(h('div', { class: 'hero-actions' }, bSync, bPut));
+    if (state === 'kode') sec.appendChild(h('div', { class: 'errbox', role: 'alert', style: 'margin-top:10px' }, 'Kode akses sudah tidak berlaku. Minta kode pasang baru ke pemilik, ketuk Putuskan sambungan, lalu pasang lagi.'));
+    return sec;
+  }
+
   function card(h, toast, fmtDate) {
     return h('div', { class: 'stack' }, syncCard(h, toast), backupCard(h, toast, fmtDate));
   }
@@ -967,7 +1020,8 @@ button.bcard:hover { background: var(--surface-2); }
 
   window.claude = { use: function (name) { return Promise.resolve(({ db: db, user: user, downloads: downloads })[name] || null); } };
   api = window.__lokal = {
-    card: card, status: status, onStatus: null,
+    card: card, salesCard: salesCard, status: status, onStatus: null, onNotice: null,
+    peran: peran, aku: aku, kodePasangUntuk: kodePasangUntuk, tautanPasangUntuk: tautanPasangUntuk, salin: salin,
     exportJson: exportJson, parseBackup: parseBackup, applyBackup: applyBackup,
     sambungkan: sambungkan, putuskan: putuskan, syncNow: syncOnce, kodePasang: kodePasang, bacaPasang: bacaPasang,
     setPoll: function (ms) { pollMs = ms; startLoop(); },
@@ -1403,7 +1457,7 @@ var uidN = 0;
 function uid(p) { uidN += 1; return (p || 'f') + uidN; }
 
 /* ===== State ===== */
-var COLL = ['warung', 'hpp', 'titipan', 'pengeluaran'];
+var COLL = ['warung', 'hpp', 'titipan', 'pengeluaran'].concat(window.__lokal ? ['karyawan'] : []);
 var TABS = [
   { key: 'beranda', label: 'Beranda', icon: 'M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10' },
   { key: 'kunjungan', label: 'Kunjungan', icon: 'M9 4h6l1 2h3v14H5V6h3zM9 13l2 2 4-4' },
@@ -1411,13 +1465,21 @@ var TABS = [
   { key: 'biaya', label: 'Biaya', icon: 'M6 3h12v18l-3-2-3 2-3-2-3 2zM9 8h6M9 12h6' },
   { key: 'laporan', label: 'Laporan', icon: 'M5 20V11M12 20V4M19 20v-6' }
 ];
+/* Versi mandiri: HP sales hanya punya dua menu. Peran ditentukan server dari kode yang dipasang. */
+var TAB_SALES = [
+  { key: 'kunjungan', label: 'Warung baru', icon: TABS[1].icon },
+  { key: 'performa', label: 'Performa', icon: TABS[4].icon }
+];
+function isSales() { return !!(window.__lokal && typeof window.__lokal.peran === 'function' && window.__lokal.peran() === 'sales'); }
+function aku() { return isSales() && typeof window.__lokal.aku === 'function' ? window.__lokal.aku() : null; }
+function tabsAktif() { return isSales() ? TAB_SALES : TABS; }
 var GRAFIK = [{ key: 'hari', label: 'Harian' }, { key: 'minggu', label: 'Mingguan' }, { key: 'bulan', label: 'Bulanan' }];
 var S = {
   tab: 'beranda',
   periode: lsGet('mt.periode') || 'bulan',
   grafik: lsGet('mt.grafik') || 'hari',
   tabel: false,
-  raw: { warung: [], hpp: [], titipan: [], pengeluaran: [] },
+  raw: { warung: [], hpp: [], titipan: [], pengeluaran: [], karyawan: [] },
   loaded: {},
   db: null, user: null, dl: null,
   noDb: false, canWrite: null, denied: false, slow: false, dbError: null,
@@ -1431,7 +1493,7 @@ function allLoaded() { return COLL.every(function (c) { return S.loaded[c]; }); 
 
 function cleanDocs(name, list) {
   return list.filter(function (d) {
-    if (name === 'warung') return typeof d.nama === 'string' && d.nama.length > 0;
+    if (name === 'warung' || name === 'karyawan') return typeof d.nama === 'string' && d.nama.length > 0;
     if (name === 'titipan') return isYMD(d.tanggalTitip);
     if (!isYMD(d.tanggal)) return false;
     if (name === 'hpp') return Number(d.kelas) === 3000 || Number(d.kelas) === 5000;
@@ -1835,8 +1897,176 @@ function batchCard(b, tap) {
     : h('div', { class: 'bcard' }, kids);
 }
 
+/* ===== Versi mandiri: tampilan sales dan kartu komisi untuk pemilik ===== */
+function tglDariTs(ts) {
+  var n = Number(ts);
+  if (!isFinite(n) || n <= 0) return '';
+  var d = new Date(n);
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+/* Performa satu sales. Komisi dihitung saat toko yang ia daftarkan menerima rencengan pertama
+   (tanggal titipan paling awal di toko itu, siapa pun yang menitipkan), sebesar nilai komisi
+   yang dicatat saat toko didaftarkan. Toko yang belum menerima rencengan menunggu dan belum dihitung. */
+function statSales(id, r) {
+  var m = S.model;
+  var toko = m.warung.filter(function (w) { return w.oleh === id; });
+  var punya = {};
+  toko.forEach(function (w) { punya[w.id] = true; });
+  var pertama = {}, ada = {};
+  m.titipan.forEach(function (t) {
+    if (!punya[t.warungId] || !t.tanggalTitip) return;
+    ada[t.warungId] = true;
+    if (!pertama[t.warungId] || t.tanggalTitip < pertama[t.warungId]) pertama[t.warungId] = t.tanggalTitip;
+  });
+  var baru = toko.filter(function (w) { return pertama[w.id] && inRange(pertama[w.id], r[0], r[1]); })
+    .sort(function (a, b) { return pertama[a.id] < pertama[b.id] ? 1 : pertama[a.id] > pertama[b.id] ? -1 : 0; });
+  var menunggu = toko.filter(function (w) { return !pertama[w.id]; })
+    .sort(function (a, b) { return num(b.dibuat) - num(a.dibuat); });
+  var o = { toko: toko, baru: baru, menunggu: menunggu, pertama: pertama, ada: ada, komisi: 0, potensi: 0, renc: 0, terjual: 0, omzet: 0 };
+  baru.forEach(function (w) { o.komisi += num(w.komisi); });
+  menunggu.forEach(function (w) { o.potensi += num(w.komisi); });
+  m.titipan.forEach(function (t) {
+    if (!punya[t.warungId]) return;
+    if (inRange(t.tanggalTitip, r[0], r[1])) o.renc += t.rencengan;
+    if (t.status === 'selesai' && inRange(t.tanggalAmbil, r[0], r[1])) { o.terjual += t.terjual; o.omzet += t.omzet; }
+  });
+  return o;
+}
+function viewWarungSales() {
+  var m = S.model, a = aku(), box = h('div', { class: 'stack' });
+  var punya = a ? m.warung.filter(function (w) { return w.oleh === a.id; }).sort(function (x, y) { return num(y.dibuat) - num(x.dibuat); }) : [];
+  var sudah = {};
+  m.titipan.forEach(function (t) { sudah[t.warungId] = (sudah[t.warungId] || 0) + t.rencengan; });
+  var belum = punya.filter(function (w) { return !sudah[w.id]; });
+  var siap = batchSiap(m);
+  if (canW()) {
+    box.appendChild(h('div', { class: 'acts' },
+      h('button', { type: 'button', class: 'btn primary act', onclick: function () { openWarung(null, { onSaved: function (id) { openTitip({ warungId: id }); } }); } },
+        h('b', null, 'Tambah warung baru'), h('small', null, 'Lalu titip rencengan pertama')),
+      h('button', { type: 'button', class: 'btn act', disabled: !belum.length || !siap.length, onclick: function () { openTitip({ warungId: belum[0].id }); } },
+        h('b', null, 'Titip rencengan pertama'), h('small', null, belum.length ? belum.length + ' warung menunggu' : 'Semua warungmu sudah dititipi'))));
+    if (!m.batches.length || !siap.length) {
+      box.appendChild(alertBox('', '!', [h('b', null, 'Belum ada stok untuk dititip. '), 'Kabari pemilik atau admin supaya belanja dicatat dulu.']));
+    }
+  }
+  var card = h('section', { class: 'card', 'aria-label': 'Warung yang kamu daftarkan' });
+  card.appendChild(h('div', { class: 'card-title' }, 'Warung yang kamu daftarkan'));
+  card.appendChild(h('div', { class: 'card-sub' }, punya.length
+    ? punya.length + ' warung.' + (canW() ? ' Ketuk untuk memperbaiki data warung.' : '')
+    : 'Belum ada. Ketuk “Tambah warung baru” saat kamu menemukan warung yang mau dititipi.'));
+  if (punya.length) {
+    var list = h('div', { class: 'list', style: 'margin-top:6px' });
+    punya.forEach(function (w) {
+      var d = tglDariTs(w.dibuat);
+      var main = h('div', { class: 'row-main' },
+        h('div', { class: 'row-t' }, w.nama),
+        h('div', { class: 'row-s' }, (d ? 'Didaftarkan ' + fmtDate(d) : 'Baru didaftarkan') + (w.alamat ? ' · ' + w.alamat : '')));
+      var right = h('div', { class: 'row-r' }, sudah[w.id] ? pill('good', '✓', 'Sudah dititip') : pill('warn', '!', 'Belum dititip'));
+      if (canW()) list.appendChild(h('button', { type: 'button', class: 'row', 'aria-label': 'Ubah data ' + w.nama, onclick: function () { openWarung(w); } }, main, right));
+      else list.appendChild(h('div', { class: 'row' }, main, right));
+    });
+    card.appendChild(list);
+  }
+  box.appendChild(card);
+  box.appendChild(h('p', { class: 'note' }, 'Komisi dihitung saat warung yang kamu daftarkan menerima rencengan pertama. Menukar atau mengambil rencengan, biaya, dan laporan dikerjakan admin atau pemilik.'));
+  if (window.__lokal && typeof window.__lokal.salesCard === 'function') box.appendChild(window.__lokal.salesCard(h, toast));
+  return box;
+}
+function viewPerforma() {
+  var a = aku(), box = h('div', { class: 'stack' });
+  if (!a) {
+    box.appendChild(emptyBox('HP ini belum tersambung', 'Performa muncul setelah HP tersambung ke pemilik lewat kode pasang.'));
+    return box;
+  }
+  var r = periodRange(S.periode, S.today);
+  var st = statSales(a.id, r);
+  var pIdx = PERIODE.filter(function (p) { return p.key === S.periode; })[0];
+  box.appendChild(filterCard(false));
+  var hero = h('section', { class: 'card hero', 'aria-label': 'Komisi' });
+  hero.appendChild(h('div', { class: 'eyebrow' }, 'Komisi · ' + (pIdx ? pIdx.label : '')));
+  hero.appendChild(h('div', { class: 'hero-row' }, h('div', { class: 'hero-val' }, rp(st.komisi))));
+  hero.appendChild(h('p', { class: 'note' }, st.baru.length
+    ? st.baru.length + ' toko menerima rencengan pertama. Tiap toko dihitung sesuai nilai komisi saat toko itu didaftarkan.'
+    : 'Belum ada toko yang menerima rencengan pertama di periode ini.'));
+  if (st.menunggu.length) {
+    hero.appendChild(h('p', { class: 'note', style: 'margin-top:6px' },
+      st.menunggu.length + ' toko menunggu rencengan pertama (' + rp(st.potensi) + ' akan masuk setelah dititipi).'));
+  }
+  hero.appendChild(h('p', { class: 'note', style: 'margin-top:6px' }, 'Nilai komisi sekarang: ' + rp(a.komisi) + ' per toko, diatur pemilik.'));
+  box.appendChild(hero);
+  box.appendChild(h('div', { class: 'tiles' },
+    tile('Toko dihitung', fmtNum(st.baru.length), fmtNum(st.menunggu.length) + ' menunggu rencengan'),
+    tile('Rencengan dititip', fmtNum(st.renc), 'Di toko-tokomu'),
+    tile('Mainan terjual', fmtNum(st.terjual) + ' pcs', 'Dari toko-tokomu'),
+    tile('Penjualan', rp(st.omzet), 'Omzet toko-tokomu')));
+  var card = h('section', { class: 'card', 'aria-label': 'Toko dihitung komisi' });
+  card.appendChild(h('div', { class: 'card-title' }, 'Toko yang sudah dihitung'));
+  if (!st.baru.length) card.appendChild(h('div', { class: 'card-sub' }, 'Belum ada di periode ini.'));
+  else {
+    var list = h('div', { class: 'list', style: 'margin-top:6px' });
+    st.baru.forEach(function (w) {
+      var dd = tglDariTs(w.dibuat);
+      list.appendChild(h('div', { class: 'row' },
+        h('div', { class: 'row-main' }, h('div', { class: 'row-t' }, w.nama),
+          h('div', { class: 'row-s' }, 'Rencengan pertama ' + fmtDate(st.pertama[w.id]) + (dd ? ' · didaftarkan ' + fmtDate(dd) : ''))),
+        h('div', { class: 'row-r' }, h('b', null, rp(w.komisi)), h('small', null, 'komisi'))));
+    });
+    card.appendChild(list);
+  }
+  box.appendChild(card);
+  if (st.menunggu.length) {
+    var tunggu = h('section', { class: 'card', 'aria-label': 'Toko menunggu rencengan pertama' });
+    tunggu.appendChild(h('div', { class: 'card-title' }, 'Menunggu rencengan pertama'));
+    tunggu.appendChild(h('div', { class: 'card-sub' }, 'Komisi baru dihitung setelah toko ini menerima rencengan.'));
+    var l2 = h('div', { class: 'list', style: 'margin-top:6px' });
+    st.menunggu.forEach(function (w) {
+      var d2 = tglDariTs(w.dibuat);
+      l2.appendChild(h('div', { class: 'row' },
+        h('div', { class: 'row-main' }, h('div', { class: 'row-t' }, w.nama),
+          h('div', { class: 'row-s' }, d2 ? 'Didaftarkan ' + fmtDate(d2) : 'Baru didaftarkan'),
+          h('div', { class: 'row-s' }, pill('warn', '!', 'Belum dihitung'))),
+        h('div', { class: 'row-r' }, h('b', null, rp(w.komisi)), h('small', null, 'komisi nanti'))));
+    });
+    tunggu.appendChild(l2);
+    box.appendChild(tunggu);
+  }
+  box.appendChild(h('p', { class: 'note' }, 'Komisi dihitung saat toko yang kamu daftarkan menerima rencengan pertama. Penjualan dan mainan terjual dari toko-tokomu hanya gambaran performa dan tidak mengubah komisi.'));
+  return box;
+}
+function salesOwnerCard(r) {
+  var L = window.__lokal;
+  if (!L || typeof L.kodePasangUntuk !== 'function' || isSales()) return null;
+  var sec = h('section', { class: 'card', 'aria-label': 'Sales dan komisi' });
+  sec.appendChild(h('div', { class: 'card-title' }, 'Sales dan komisi'));
+  sec.appendChild(h('div', { class: 'card-sub' }, 'Sales hanya mencari warung baru. Komisi dihitung saat toko yang ia daftarkan menerima rencengan pertama (siapa pun yang menitipkan), sebesar nilai komisi per toko. Periode: ' + rangeLabel(S.periode, r[0], r[1], S.model.firstDate) + '.'));
+  var list = cleanDocs('karyawan', S.raw.karyawan || []).slice().sort(function (a, b) { return String(a.nama).localeCompare(String(b.nama)); });
+  if (!L.status()) sec.appendChild(alertBox('info', 'i', 'Hubungkan HP ini ke Google Sheet dulu (kartu “Sinkron antar HP” di bawah). Setelah itu sales bisa memasang aplikasi dengan kode pasangnya.'));
+  if (list.length) {
+    var tot = 0, rows = h('div', { class: 'list', style: 'margin-top:6px' });
+    list.forEach(function (k) {
+      var st = statSales(k.id, r);
+      tot += st.komisi;
+      var main = h('div', { class: 'row-main' },
+        h('div', { class: 'row-t' }, k.nama, ' ', k.aktif === false ? pill('flat', '○', 'Nonaktif') : null),
+        h('div', { class: 'row-s' }, st.baru.length + ' toko dihitung · ' + st.menunggu.length + ' menunggu rencengan pertama · ' + fmtNum(st.terjual) + ' pcs terjual · omzet ' + rp(st.omzet)),
+        h('div', { class: 'row-s' }, 'Nilai komisi ' + rp(k.komisi) + ' per toko'));
+      var right = h('div', { class: 'row-r' }, h('b', null, rp(st.komisi)), h('small', null, 'komisi'));
+      if (canW()) rows.appendChild(h('button', { type: 'button', class: 'row', 'aria-label': 'Ubah ' + k.nama, onclick: function () { openSales(k); } }, main, right));
+      else rows.appendChild(h('div', { class: 'row' }, main, right));
+    });
+    rows.appendChild(h('div', { class: 'row' }, h('div', { class: 'row-main' }, h('div', { class: 'row-t' }, 'Total komisi periode ini')), h('div', { class: 'row-r' }, h('b', null, rp(tot)))));
+    sec.appendChild(rows);
+    sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Hanya warung yang didaftarkan lewat HP sales yang dihitung. Kalau titipan pertama sebuah toko dihapus, toko itu kembali menunggu dan tidak dihitung. Komisi yang sudah kamu bayar, catat di menu Biaya (kategori Upah).'));
+  } else {
+    sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Belum ada sales. Tambahkan sales, atur nilai komisi per toko baru, lalu kirim kode pasangnya.'));
+  }
+  if (canW()) sec.appendChild(h('div', { class: 'hero-actions' }, h('button', { type: 'button', class: 'btn primary', onclick: function () { openSales(null); } }, '+ Tambah sales')));
+  return sec;
+}
+
 /* ===== Tab: Kunjungan (titip dan ambil rencengan) ===== */
 function viewKunjungan() {
+  if (isSales()) return viewWarungSales();
   var m = S.model;
   var box = h('div', { class: 'stack' });
   var siap = batchSiap(m);
@@ -2169,6 +2399,8 @@ function viewLaporan() {
   else ex.appendChild(h('p', { class: 'note', style: 'margin-top:10px' }, 'Excel berisi enam lembar: ringkasan, per warung, per batch, pengambilan, belanja & batch, dan biaya.'));
   box.appendChild(ex);
   // Hanya ada di versi mandiri (PWA) yang menyimpan data di HP
+  var soc = salesOwnerCard(r);
+  if (soc) box.appendChild(soc);
   if (window.__lokal && typeof window.__lokal.card === 'function') box.appendChild(window.__lokal.card(h, toast, fmtDate));
   return box;
 }
@@ -2538,7 +2770,7 @@ function guideSheet(title, text, actions) {
 function offerTitip(warungId, intro) {
   computeModel();
   var m = S.model, w = m.wMap[warungId];
-  if (!w || !canW()) return;
+  if (!w || !canW() || isSales()) return;
   var siap = batchSiap(m);
   openSheet('Titip rencengan baru?', function (body) {
     body.appendChild(h('p', { class: 'note', style: 'font-size:15px' }, intro + ' '));
@@ -2561,11 +2793,15 @@ function openTitip(opts) {
   if (!canW()) return;
   computeModel();
   var m = S.model, edit = opts.edit ? (findBy(m.titipan, opts.edit.id) || opts.edit) : null;
+  var kar = isSales(), me = aku();
+  if (kar) edit = null; // sales hanya menitip rencengan pertama, tidak mengubah titipan
 
-  // Warung yang boleh dipilih: belum punya rencengan yang masih di warung
+  // Warung yang boleh dipilih: belum punya rencengan yang masih di warung.
+  // Untuk sales: hanya warung miliknya yang belum pernah dititipi.
   var busyW = {};
   m.aktif.forEach(function (a) { if (!edit || a.id !== edit.id) busyW[a.warungId] = true; });
   var choices = m.warung.filter(function (w) {
+    if (kar) return !!me && w.oleh === me.id && !m.titipan.some(function (t) { return t.warungId === w.id; });
     return (w.status !== 'nonaktif' && !busyW[w.id]) || (edit && edit.warungId === w.id);
   });
   var blist = batchSiap(m);
@@ -2573,9 +2809,15 @@ function openTitip(opts) {
 
   if (!m.batches.length || (!blist.length && !edit)) {
     guideSheet('Titip rencengan baru',
-      !m.batches.length ? 'Belum ada batch. Catat belanja dulu; tiap belanja menjadi satu batch yang bisa dititipkan.'
+      kar ? 'Belum ada stok untuk dititip. Kabari pemilik atau admin supaya belanja dicatat dulu.'
+        : !m.batches.length ? 'Belum ada batch. Catat belanja dulu; tiap belanja menjadi satu batch yang bisa dititipkan.'
         : 'Stok gudang tiap batch kurang dari satu rencengan (50 mainan). Catat belanja batch baru supaya bisa menitip lagi.',
-      [{ label: 'Catat belanja', primary: true, run: function () { openHpp(); } }]);
+      kar ? [] : [{ label: 'Catat belanja', primary: true, run: function () { openHpp(); } }]);
+    return;
+  }
+  if (kar && !choices.length) {
+    guideSheet('Titip rencengan pertama', 'Semua warung yang kamu daftarkan sudah dititipi. Tambah warung baru kalau kamu menemukan yang lain. Menukar rencengan dikerjakan admin atau pemilik.',
+      [{ label: 'Tambah warung baru', primary: true, run: function () { openWarung(null, { onSaved: function (id) { openTitip({ warungId: id }); } }); } }]);
     return;
   }
   if (!choices.length) {
@@ -2617,7 +2859,7 @@ function openTitip(opts) {
   }
   function refresh() {
     var c = calc(), b = c.b;
-    f.batHint.textContent = b ? 'Stok gudang ' + b.label + ': ' + fmtNum(c.avail) + ' pcs, cukup untuk ' + c.max + ' rencengan. HPP ' + rp(b.perPcs) + ' per pcs.' : '';
+    f.batHint.textContent = b ? 'Stok gudang ' + b.label + ': ' + fmtNum(c.avail) + ' pcs, cukup untuk ' + c.max + ' rencengan.' + (kar ? '' : ' HPP ' + rp(b.perPcs) + ' per pcs.') : '';
     f.info.textContent = '';
     f.info.className = 'calc' + (c.bad && b ? ' err' : '');
     if (!b) { f.info.appendChild(document.createTextNode('Pilih batch.')); return; }
@@ -2630,7 +2872,7 @@ function openTitip(opts) {
     }
     markBad(f.renc, false);
     f.info.appendChild(h('b', null, c.renc + ' rencengan = ' + fmtNum(c.pcs) + ' pcs'));
-    f.info.appendChild(document.createTextNode('. Modal ' + rp(c.modal) + ' (HPP ' + rp(b.perPcs) + ' per pcs). Kalau laku semua, omzet ' + rp(c.jual) + '. Stok gudang ' + b.label + ' setelah ini: ' + fmtNum(c.avail - c.pcs) + ' pcs.'));
+    f.info.appendChild(document.createTextNode((kar ? '' : '. Modal ' + rp(c.modal) + ' (HPP ' + rp(b.perPcs) + ' per pcs). Kalau laku semua, omzet ' + rp(c.jual)) + '. Stok gudang ' + b.label + ' setelah ini: ' + fmtNum(c.avail - c.pcs) + ' pcs.'));
     var w = m.wMap[f.war.value];
     f.warHint.textContent = w ? 'Bagian ' + w.nama + ': ' + rp(feeFor(w, b.kelas)) + ' per mainan terjual.' : '';
   }
@@ -2644,13 +2886,13 @@ function openTitip(opts) {
   } }, '+ Warung baru');
 
   openSheet(edit ? 'Ubah titipan' : 'Titip rencengan baru', function (body) {
-    body.appendChild(h('div', { class: 'note' }, edit ? 'Ubah catatan rencengan yang sedang ada di warung.' : 'Rencengan baru yang kamu tinggal di warung. Laba dihitung nanti saat rencengannya diambil.'));
+    body.appendChild(h('div', { class: 'note' }, edit ? 'Ubah catatan rencengan yang sedang ada di warung.' : kar ? 'Rencengan pertama yang kamu tinggal di warung baru.' : 'Rencengan baru yang kamu tinggal di warung. Laba dihitung nanti saat rencengannya diambil.'));
     body.appendChild(fieldEl('Tanggal titip', f.tgl));
     var warField = fieldEl('Warung', f.war);
     warField.appendChild(f.warHint);
     if (!edit) warField.appendChild(h('div', null, addWar));
     body.appendChild(warField);
-    var batField = fieldEl('Batch', f.bat, 'HPP batch yang dipilih dipakai untuk menghitung laba. Yang tertua ada di atas.');
+    var batField = fieldEl('Batch', f.bat, kar ? 'Pilih batch yang dititip. Yang tertua ada di atas.' : 'HPP batch yang dipilih dipakai untuk menghitung laba. Yang tertua ada di atas.');
     batField.appendChild(f.batHint);
     body.appendChild(batField);
     body.appendChild(fieldEl('Jumlah rencengan', stepper(f.renc, 1), '1 rencengan = ' + ISI + ' mainan', f.renc));
@@ -2691,7 +2933,7 @@ function openTitip(opts) {
 /* ===== Form: ambil rencengan lama ===== */
 function openAmbil(opts) {
   opts = opts || {};
-  if (!canW()) return;
+  if (!canW() || isSales()) return;
   computeModel();
   var m = S.model;
   var edit = opts.edit ? (findBy(m.titipan, opts.edit.id) || opts.edit) : null;
@@ -2882,7 +3124,7 @@ function openAmbil(opts) {
 /* ===== Form: belanja = batch baru ===== */
 function openHpp(opts) {
   opts = opts || {};
-  if (!canW()) return;
+  if (!canW() || isSales()) return;
   computeModel();
   var m = S.model, edit = opts.edit ? (m.bMap[opts.edit.id] || opts.edit) : null;
   var kelas = edit ? edit.kelas : 3000;
@@ -2973,7 +3215,7 @@ function openHpp(opts) {
 /* ===== Form: biaya ===== */
 function openBiaya(opts) {
   opts = opts || {};
-  if (!canW()) return;
+  if (!canW() || isSales()) return;
   var edit = opts.edit || null;
   var kats = KATEGORI_BIAYA.slice();
   if (edit && kats.indexOf(edit.kategori) < 0) kats.push(edit.kategori);
@@ -3011,6 +3253,7 @@ function openWarung(w, opts) {
   if (!canW()) return;
   var m = S.model;
   var edit = w || null;
+  var kar = isSales(), me = aku();
   var status = edit && edit.status === 'nonaktif' ? 'nonaktif' : 'aktif';
   var f = {
     nama: h('input', { type: 'text', class: 'inp', maxlength: '80', placeholder: 'Contoh: Warung Bu Siti' }),
@@ -3034,20 +3277,28 @@ function openWarung(w, opts) {
     body.appendChild(fieldEl('Bagian warung per mainan Rp5.000', moneyWrap(f.fee5), 'Boleh dikosongkan sampai kamu mulai menjual mainan Rp5.000.', f.fee5));
     body.appendChild(fieldEl('Alamat', f.alamat));
     body.appendChild(fieldEl('Kontak', f.kontak));
-    if (edit) body.appendChild(h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'Status'), statusHost));
+    if (edit && !kar) body.appendChild(h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'Status'), statusHost));
     body.appendChild(fieldEl('Catatan', f.catatan));
   }, function (foot, api) {
-    if (edit && !hasVisits) deleteButton(foot, api, 'warung', edit.id, 'Warung dihapus.');
+    if (edit && !hasVisits && !kar) deleteButton(foot, api, 'warung', edit.id, 'Warung dihapus.');
     foot.appendChild(h('button', { type: 'button', class: 'btn', onclick: api.close }, 'Batal'));
     var save = h('button', { type: 'button', class: 'btn primary', onclick: function () {
       var err = [];
       if (!f.nama.value.trim()) { err.push('Isi nama warung.'); markBad(f.nama, true); } else markBad(f.nama, false);
+      if (kar && f.nama.value.trim()) {
+        var nm = f.nama.value.trim().toLowerCase();
+        if (m.warung.some(function (x) { return (!edit || x.id !== edit.id) && String(x.nama || '').trim().toLowerCase() === nm; })) {
+          err.push('Nama warung ini sudah terdaftar. Satu warung hanya bisa didaftarkan sekali. Cek lagi nama atau tambahkan lokasinya.'); markBad(f.nama, true);
+        }
+      }
       if (f.fee3.value === '') { err.push('Isi bagian warung per mainan Rp3.000. Isi 0 kalau warung tidak mendapat bagian.'); markBad(f.fee3, true); } else markBad(f.fee3, false);
       if (ni(f.fee3) >= 3000) err.push('Bagian warung per mainan Rp3.000 harus lebih kecil dari Rp3.000.');
       if (ni(f.fee5) >= 5000) err.push('Bagian warung per mainan Rp5.000 harus lebih kecil dari Rp5.000.');
       if (err.length) { api.setErrors(err); return; }
       api.setErrors([]);
       var data = { nama: f.nama.value.trim(), bagian3: ni(f.fee3), bagian5: ni(f.fee5), alamat: f.alamat.value.trim(), kontak: f.kontak.value.trim(), catatan: f.catatan.value.trim(), status: status, dibuat: edit ? num(edit.dibuat) || Date.now() : Date.now() };
+      // Penanda sales juga diisi server; ini hanya supaya tampilan di HP ini langsung benar
+      if (kar && me) { data.oleh = edit ? (edit.oleh || me.id) : me.id; data.komisi = edit ? num(edit.komisi) : me.komisi; }
       var done = busy(save);
       persist('warung', edit ? edit.id : null, data).then(function (id) {
         closeSheet();
@@ -3056,6 +3307,85 @@ function openWarung(w, opts) {
         else offerTitip(id, 'Warung ' + data.nama + ' sudah ditambahkan.');
       }, function (e) { done(); writeFail(api, e); });
     } }, edit ? 'Simpan perubahan' : 'Simpan warung');
+    foot.appendChild(save);
+  });
+}
+
+/* ===== Form: sales dan komisinya (hanya pemilik atau admin) ===== */
+var KARAKTER_KODE = 'abcdefghjkmnpqrstuvwxyz23456789';
+function bikinKode() {
+  var a = new Uint8Array(20), s = '';
+  if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(a);
+  else for (var i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 256);
+  for (var j = 0; j < a.length; j++) s += KARAKTER_KODE.charAt(a[j] % KARAKTER_KODE.length);
+  return s;
+}
+function openSales(k) {
+  if (!canW() || isSales()) return;
+  var L = window.__lokal || {};
+  var edit = k || null;
+  var aktif = !edit || edit.aktif !== false;
+  var f = {
+    nama: h('input', { type: 'text', class: 'inp', maxlength: '60', placeholder: 'Nama sales' }),
+    komisi: mkNum(edit ? num(edit.komisi) : null, 'contoh: 15000')
+  };
+  if (edit) f.nama.value = edit.nama;
+  var statusHost = h('div');
+  function drawStatus() {
+    statusHost.textContent = '';
+    statusHost.appendChild(seg([{ key: 'ya', label: 'Aktif' }, { key: 'tidak', label: 'Nonaktif' }], aktif ? 'ya' : 'tidak', function (v) { aktif = v === 'ya'; drawStatus(); }, 'Status sales'));
+  }
+  drawStatus();
+  var terhubung = !!(L.status && L.status());
+  openSheet(edit ? 'Ubah sales' : 'Tambah sales', function (body) {
+    body.appendChild(fieldEl('Nama', f.nama));
+    body.appendChild(fieldEl('Komisi per toko', moneyWrap(f.komisi), 'Dibayarkan untuk tiap warung yang didaftarkan sales ini dan sudah menerima rencengan pertama. Kalau nilainya diubah, hanya berlaku untuk warung yang didaftarkan sesudahnya. Warung yang sudah terdaftar tetap memakai nilai saat didaftarkan.', f.komisi));
+    if (!edit) { body.appendChild(h('p', { class: 'note' }, 'Setelah disimpan, kode pasang untuk sales ini muncul di layar berikutnya.')); return; }
+    body.appendChild(h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'Status'), statusHost, h('div', { class: 'hint' }, 'Sales nonaktif langsung tidak bisa masuk lagi.')));
+    var box = h('div', { class: 'box' }, h('h3', null, 'Kode pasang sales'));
+    if (!terhubung) {
+      box.appendChild(h('p', { class: 'note' }, 'HP ini belum tersambung ke Google Sheet. Hubungkan dulu lewat kartu “Sinkron antar HP” di menu Laporan, baru kode pasang bisa dibuat.'));
+    } else {
+      box.appendChild(h('p', { class: 'note' }, 'Kirim lewat chat pribadi ke ' + edit.nama + '. Sales memasang aplikasi, membuka menu Laporan, lalu menempel kode ini di bagian “Admin atau sales”. Kode ini khusus untuknya, jangan dibagi ke orang lain.'));
+      var kodeInp = h('input', { type: 'text', class: 'inp', readonly: true, value: L.kodePasangUntuk(edit.kode), 'aria-label': 'Kode pasang sales' });
+      box.appendChild(h('div', { style: 'margin-top:8px' }, kodeInp));
+      box.appendChild(h('div', { class: 'hero-actions' },
+        h('button', { type: 'button', class: 'btn primary sm', onclick: function () { L.salin(L.kodePasangUntuk(edit.kode), toast, 'Kode pasang ' + edit.nama + ' disalin.', kodeInp); } }, 'Salin kode pasang'),
+        h('button', { type: 'button', class: 'btn sm', onclick: function () { L.salin(L.tautanPasangUntuk(edit.kode), toast, 'Tautan pasang ' + edit.nama + ' disalin.', kodeInp); } }, 'Salin tautan pasang')));
+      var armed = false, tm = 0;
+      var ganti = h('button', { type: 'button', class: 'btn danger sm', 'data-keeperr': true, onclick: function () {
+        if (!armed) { armed = true; ganti.textContent = 'Ketuk lagi untuk mengganti kode'; tm = setTimeout(function () { armed = false; ganti.textContent = 'Ganti kode'; }, 4000); return; }
+        clearTimeout(tm);
+        var base = Object.assign({}, edit); delete base.id;
+        base.kode = bikinKode();
+        persist('karyawan', edit.id, base).then(function () {
+          closeSheet(); toast('Kode diganti. Kode lama langsung tidak berlaku, kirim kode pasang yang baru.');
+          openSales(findBy(S.raw.karyawan, edit.id));
+        }, function (e) { armed = false; ganti.textContent = 'Ganti kode'; toast('Belum bisa mengganti kode. Coba lagi.'); });
+      } }, 'Ganti kode');
+      box.appendChild(h('p', { class: 'note', style: 'margin-top:10px' }, 'Kalau kode bocor atau sales berhenti, ganti kode atau nonaktifkan.'));
+      box.appendChild(h('div', { style: 'margin-top:6px' }, ganti));
+    }
+    body.appendChild(box);
+  }, function (foot, api) {
+    foot.appendChild(h('button', { type: 'button', class: 'btn', onclick: api.close }, edit ? 'Tutup' : 'Batal'));
+    var save = h('button', { type: 'button', class: 'btn primary', onclick: function () {
+      var err = [];
+      var nm = f.nama.value.trim();
+      if (!nm) { err.push('Isi nama sales.'); markBad(f.nama, true); } else markBad(f.nama, false);
+      if (f.komisi.value === '') { err.push('Isi komisi per toko. Isi 0 kalau belum ada.'); markBad(f.komisi, true); } else markBad(f.komisi, false);
+      if (err.length) { api.setErrors(err); return; }
+      api.setErrors([]);
+      var base = edit ? Object.assign({}, edit) : { kode: bikinKode(), catatan: '', dibuat: Date.now() };
+      delete base.id;
+      var data = Object.assign(base, { nama: nm, komisi: ni(f.komisi), aktif: aktif });
+      var done = busy(save);
+      persist('karyawan', edit ? edit.id : null, data).then(function (id) {
+        closeSheet();
+        if (edit) toast('Sales diperbarui.');
+        else { toast('Sales ditambahkan. Salin kode pasangnya untuk dikirim.'); openSales(findBy(S.raw.karyawan, id)); }
+      }, function (e) { done(); writeFail(api, e); });
+    } }, edit ? 'Simpan perubahan' : 'Simpan sales');
     foot.appendChild(save);
   });
 }
@@ -3109,7 +3439,7 @@ function renderNotices() {
 function renderNav() {
   var nav = $('nav');
   nav.textContent = '';
-  TABS.forEach(function (t) {
+  tabsAktif().forEach(function (t) {
     var ic = sv('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' }, sv('path', { d: t.icon }));
     nav.appendChild(h('button', { type: 'button', 'aria-current': t.key === S.tab ? 'page' : null, onclick: function () { goTab(t.key); } }, ic, h('span', null, t.label)));
   });
@@ -3128,16 +3458,18 @@ function renderSync() {
   el.lastChild.textContent = txt;
 }
 
-var VIEWS = { beranda: viewBeranda, kunjungan: viewKunjungan, belanja: viewBelanja, biaya: viewBiaya, laporan: viewLaporan };
+var VIEWS = { beranda: viewBeranda, kunjungan: viewKunjungan, belanja: viewBelanja, biaya: viewBiaya, laporan: viewLaporan, performa: viewPerforma };
 function render() {
   computeModel();
+  // HP sales hanya punya menu Warung baru dan Performa; alamat menu lain diarahkan ke menu pertamanya
+  if (!tabsAktif().some(function (t) { return t.key === S.tab; })) S.tab = tabsAktif()[0].key;
   renderNav(); renderNotices(); renderSync();
   S.after = [];
   var node;
   if (S.noDb) node = h('div');
   else if (!allLoaded()) node = h('div', { class: 'loading' }, 'Memuat data', h('span', { class: 'dots' }));
   else {
-    node = h('div', null, h('h1', { class: 'sr' }, TABS.filter(function (t) { return t.key === S.tab; })[0].label), VIEWS[S.tab]());
+    node = h('div', null, h('h1', { class: 'sr' }, tabsAktif().filter(function (t) { return t.key === S.tab; })[0].label), VIEWS[S.tab]());
   }
   $('view').replaceChildren(node);
   S.after.forEach(function (fn) { fn(); });
@@ -3151,7 +3483,7 @@ function schedule() {
 /* ===== Mulai ===== */
 function tabFromHash() {
   var k = location.hash.replace('#', '');
-  return TABS.some(function (t) { return t.key === k; }) ? k : 'beranda';
+  return tabsAktif().some(function (t) { return t.key === k; }) ? k : tabsAktif()[0].key;
 }
 function subscribe() {
   COLL.forEach(function (name) {
@@ -3182,7 +3514,7 @@ function init() {
   var rt = 0;
   window.addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(function () { if (S.tab === 'beranda' && allLoaded() && !sheetState) render(); }, 160); });
   render();
-  if (window.__lokal) window.__lokal.onStatus = function () { schedule(); };
+  if (window.__lokal) { window.__lokal.onStatus = function () { schedule(); }; window.__lokal.onNotice = function (m) { toast(m); }; }
   var c = window.claude;
   if (!c || typeof c.use !== 'function') { S.noDb = true; render(); return; }
   Promise.all([
