@@ -194,7 +194,7 @@ h1, h2, h3, p { margin: 0; }
 @media (min-width: 560px) { .tiles.t4 { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px; min-width: 0; }
 .tile-l { font-size: 13px; color: var(--ink-2); font-weight: 550; }
-.tile-v { font-size: 22px; font-weight: 650; letter-spacing: -0.01em; margin-top: 2px; overflow-wrap: anywhere; }
+.tile-v { font-size: clamp(17px, 5.6vw, 22px); font-weight: 650; letter-spacing: -0.01em; margin-top: 2px; overflow-wrap: anywhere; }
 .tile-s { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; }
 
 /* ---- Grafik ---- */
@@ -417,7 +417,7 @@ button.bcard:hover { background: var(--surface-2); }
    - Kalau dihubungkan ke Google Sheet, setiap perubahan dikirim lewat antrean dan perubahan HP lain diambil tiap beberapa detik. */
 (function () {
   'use strict';
-  var APP_VERSI = 'v4b'; // harus sama dengan VERSI di sw.js (build_pwa.sh memeriksanya)
+  var APP_VERSI = 'v5'; // harus sama dengan VERSI di sw.js (build_pwa.sh memeriksanya)
   var KEY = 'bukutitip.data.v1';
   var KEY_TERAKHIR = 'bukutitip.cadangan.terakhir';
   var KEY_CFG = 'bukutitip.sync.cfg';
@@ -1196,14 +1196,94 @@ function axisLabel(v, compact) {
 }
 
 
-/* ===== Model batch dan rencengan =====
-   Satu belanja = satu batch (dokumen "hpp"). Satu penitipan = satu dokumen "titipan":
-   dibuat saat rencengan dititip, dilengkapi saat rencengan diambil kembali.
-   Laba dicatat saat rencengan diambil, memakai HPP per mainan milik batch yang dipilih saat menitip. */
+/* ===== Model batch dan rencengan (v5: stok berlapis, FIFO) =====
+   Satu belanja = satu batch = satu lapis stok (dokumen "hpp") dengan HPP per mainan yang tetap dan tercatat.
+   Satu penitipan = satu dokumen "titipan": dibuat saat rencengan dititip, dilengkapi saat rencengan diambil kembali.
+   Saat menitip, mainan diambil dari lapis TERTUA dulu (FIFO). Satu rencengan boleh berisi dua lapis atau lebih;
+   asal tiap mainan tercatat di titipan.alokasi = [{b: idBatch, pcs: jumlah}].
+   Saat diambil, sisa mainan kembali ke lapis asalnya dengan HPP yang sama. Laba dicatat saat rencengan diambil.
+   Titipan lama (hanya punya "batch") dibaca sebagai satu lapis, jadi angka lama tidak berubah. */
 var ISI = 50; // jumlah mainan dalam satu rencengan
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function idStr(x) { return String(x === undefined || x === null ? '' : x); }
+
+/* Membagi bilangan bulat `total` ke beberapa bagian sebanding `bobot` (metode sisa terbesar):
+   jumlah hasil SELALU sama dengan total. Seri dimenangkan bagian yang lebih awal (lapis yang lebih tua).
+   Kalau semua bobot nol, dipakai `cadangan` (bila ada) atau pembagian rata. */
+function bagiBulat(total, bobot, cadangan) {
+  var n = bobot.length, i, W = 0, w = [];
+  if (!n) return [];
+  total = Math.max(0, Math.round(num(total)));
+  for (i = 0; i < n; i++) { w[i] = Math.max(0, Math.round(num(bobot[i]))); W += w[i]; }
+  if (W <= 0) {
+    W = 0;
+    for (i = 0; i < n; i++) { w[i] = cadangan ? Math.max(0, Math.round(num(cadangan[i]))) : 1; W += w[i]; }
+    if (W <= 0) { for (i = 0; i < n; i++) w[i] = 1; W = n; }
+  }
+  var out = [], rem = [], used = 0, idx = [];
+  for (i = 0; i < n; i++) {
+    var p = total * w[i];
+    out[i] = Math.floor(p / W); rem[i] = p - out[i] * W; used += out[i]; idx.push(i);
+  }
+  idx.sort(function (a, b) { return rem[b] - rem[a] || a - b; });
+  for (i = 0; i < total - used; i++) out[idx[i]] += 1;
+  return out;
+}
+
+/* Membaca asal mainan sebuah titipan. Titipan lama (tanpa "alokasi") = satu lapis dari kolom batch.
+   Alokasi yang jumlahnya tidak cocok dengan pcs titipan dianggap rusak dan dibaca seperti titipan lama. */
+function bacaAlokasi(t, pcs) {
+  var a = t.alokasi;
+  if (typeof a === 'string') { try { a = JSON.parse(a); } catch (e) { a = null; } }
+  if (Array.isArray(a) && a.length) {
+    var order = [], sum = {}, total = 0, ok = true;
+    a.forEach(function (x) {
+      var id = idStr(x && x.b), p = x ? Math.round(num(x.pcs)) : 0;
+      if (!id || p <= 0) { ok = false; return; }
+      if (!Object.prototype.hasOwnProperty.call(sum, id)) { sum[id] = 0; order.push(id); }
+      sum[id] += p; total += p;
+    });
+    if (ok && total === pcs) return order.map(function (id) { return { b: id, pcs: sum[id] }; });
+  }
+  return [{ b: idStr(t.batch), pcs: pcs }];
+}
+
+/* Membagi hasil satu titipan ke tiap lapis. Sisa dibagi sebanding isi tiap lapis; rusak sebanding mainan yang tidak kembali;
+   bagian warung sebanding yang terjual; setoran sebanding pendapatan bersih. Satu lapis = angka titipan apa adanya. */
+function bagiLapis(al, bMap, p) {
+  var n = al.length, i, pcsL = al.map(function (a) { return a.pcs; });
+  var zero = pcsL.map(function () { return 0; });
+  var sisaL = !p.done ? zero : n === 1 ? [p.sisa] : bagiBulat(p.sisa, pcsL);
+  var capL = pcsL.map(function (v, k) { return v - sisaL[k]; });
+  var rusakL = !p.done ? zero : n === 1 ? [p.rusak] : bagiBulat(p.rusak, capL);
+  var terjualL = pcsL.map(function (v, k) { return p.done ? v - sisaL[k] - rusakL[k] : 0; });
+  var bagianL = !p.done ? zero : n === 1 ? [p.bagian] : bagiBulat(p.bagian, terjualL, pcsL);
+  var omzetL = terjualL.map(function (v) { return v * p.kelas; });
+  var pendL = omzetL.map(function (v, k) { return v - bagianL[k]; });
+  var setoranL = !p.done ? zero : n === 1 ? [p.setoran] : bagiBulat(p.setoran, pendL.map(function (v) { return Math.max(0, v); }), pcsL);
+  var out = [];
+  for (i = 0; i < n; i++) {
+    var b = bMap[al[i].b] || null, h = b ? b.perPcs : 0;
+    var hppT = Math.round(terjualL[i] * h), rugi = Math.round(rusakL[i] * h);
+    out.push({
+      batchId: al[i].b, batch: b, kelas: p.kelas, pcs: pcsL[i], h: h,
+      sisa: sisaL[i], rusak: rusakL[i], terjual: terjualL[i], omzet: omzetL[i], bagian: bagianL[i], pend: pendL[i],
+      hppT: hppT, rugi: rugi, labaKotor: pendL[i] - hppT - rugi, setoran: setoranL[i]
+    });
+  }
+  return out;
+}
+
+/* Nama gabungan lapis, misalnya "Rp3.000 · Batch 1 + 2" */
+function labelLapis(lapis, kelas) {
+  if (lapis.length === 1) return lapis[0].batch ? lapis[0].batch.label : '(batch dihapus)';
+  var ada = lapis.filter(function (s) { return s.batch; }).map(function (s) { return s.batch; });
+  var hilang = lapis.length - ada.length;
+  var nomor = ada.map(function (b) { return b.nomor; });
+  var txt = rp(kelas) + ' · Batch ' + nomor.join(' + ');
+  return hilang ? (ada.length ? txt + ' + batch dihapus' : '(batch dihapus)') : txt;
+}
 function cmpDesc(a, b) {
   if (a.tanggal !== b.tanggal) return a.tanggal < b.tanggal ? 1 : -1;
   var d = num((b.raw || {}).dibuat) - num((a.raw || {}).dibuat);
@@ -1260,13 +1340,13 @@ function buildModel(data, today) {
 
   /* ---- Penitipan ---- */
   var all = titip.map(function (t) {
-    var b = bMap[t.batch] || null;
-    var kelas = b ? b.kelas : (Number(t.kelas) === 5000 ? 5000 : 3000);
     var renc = Math.max(0, Math.round(num(t.rencengan)));
     var pcs = num(t.pcs) > 0 ? Math.round(num(t.pcs)) : renc * ISI;
+    var al = bacaAlokasi(t, pcs);
+    var b0 = bMap[al[0].b] || null;
+    var kelas = b0 ? b0.kelas : (Number(t.kelas) === 5000 ? 5000 : 3000);
     var done = isYMD(t.tanggalAmbil);
     var w = wMap[t.warung];
-    var h = b ? b.perPcs : 0;
     var sisa = 0, rusak = 0;
     if (done) {
       sisa = clamp(Math.round(num(t.sisa)), 0, pcs);
@@ -1279,34 +1359,48 @@ function buildModel(data, today) {
       bagian = (t.bagian !== undefined && t.bagian !== null) ? Math.max(0, Math.round(num(t.bagian))) : terjual * feeFor(w, kelas);
     }
     var pend = omzet - bagian;
-    var hppT = Math.round(terjual * h), rugi = Math.round(rusak * h);
     var setoran = done ? num(t.setoran) : 0;
+    var lapis = bagiLapis(al, bMap, { done: done, pcs: pcs, sisa: sisa, rusak: rusak, kelas: kelas, bagian: bagian, setoran: setoran });
+    var hppT = 0, rugi = 0, modalExact = 0, noHpp = false;
+    lapis.forEach(function (s) {
+      hppT += s.hppT; rugi += s.rugi; modalExact += s.pcs * s.h;
+      if (done && s.h === 0 && (s.terjual > 0 || s.rusak > 0)) noHpp = true;
+    });
+    var h = lapis.length === 1 ? lapis[0].h : (pcs > 0 ? modalExact / pcs : 0);
     var endDate = done ? t.tanggalAmbil : today;
+    var b1 = lapis[0].batch;
     return {
       id: t.id, raw: t, status: done ? 'selesai' : 'aktif',
       warungId: t.warung, warungNama: (w || {}).nama || '(warung dihapus)',
-      batchId: t.batch, batch: b, batchLabel: b ? b.label : '(batch dihapus)', kelas: kelas,
+      batchId: al[0].b, batch: b1, batchLabel: labelLapis(lapis, kelas), kelas: kelas,
+      alokasi: al, lapis: lapis, campur: lapis.length > 1,
       rencengan: renc, pcs: pcs, tanggalTitip: t.tanggalTitip, tanggalAmbil: done ? t.tanggalAmbil : '',
       tanggal: done ? t.tanggalAmbil : t.tanggalTitip,
       hari: Math.max(0, daysBetween(t.tanggalTitip, endDate)),
       sisa: sisa, rusak: rusak, terjual: terjual, omzet: omzet, bagian: bagian, pend: pend,
       h: h, hppT: hppT, rugi: rugi, labaKotor: pend - hppT - rugi,
       setoran: setoran, piutang: done ? pend - setoran : 0,
-      modal: Math.round(pcs * h), potensi: pcs * kelas,
-      noHpp: done && h === 0 && (terjual > 0 || rusak > 0), catatan: t.catatan || ''
+      modal: Math.round(lapis.length === 1 ? pcs * h : modalExact), potensi: pcs * kelas,
+      noHpp: noHpp, catatan: t.catatan || ''
     };
   });
   all.forEach(function (o) {
-    var b = o.batch;
-    if (!b) return;
-    b.titipan.push(o);
-    b.dititip += o.pcs;
-    if (o.status === 'selesai') {
-      b.donePcs += o.pcs; b.kembali += o.sisa; b.rusak += o.rusak; b.terjual += o.terjual;
-      b.omzet += o.omzet; b.bagian += o.bagian; b.hppT += o.hppT; b.rugi += o.rugi; b.setoran += o.setoran;
-    } else {
-      b.diWarung += o.pcs;
-    }
+    o.lapis.forEach(function (s) {
+      var b = s.batch;
+      if (!b) return;
+      // Tampilan titipan dari sudut pandang satu batch: angka yang dipakai adalah bagian batch itu saja
+      b.titipan.push(Object.assign({}, o, {
+        pcs: s.pcs, sisa: s.sisa, rusak: s.rusak, terjual: s.terjual, omzet: s.omzet, bagian: s.bagian, pend: s.pend,
+        hppT: s.hppT, rugi: s.rugi, labaKotor: s.labaKotor, setoran: s.setoran, h: s.h, totalPcs: o.pcs
+      }));
+      b.dititip += s.pcs;
+      if (o.status === 'selesai') {
+        b.donePcs += s.pcs; b.kembali += s.sisa; b.rusak += s.rusak; b.terjual += s.terjual;
+        b.omzet += s.omzet; b.bagian += s.bagian; b.hppT += s.hppT; b.rugi += s.rugi; b.setoran += s.setoran;
+      } else {
+        b.diWarung += s.pcs;
+      }
+    });
   });
   batches.forEach(function (b) {
     b.titipan.sort(cmpDesc);
@@ -1365,6 +1459,12 @@ function buildModel(data, today) {
     if (b.kelas === 5000) gudang5 += g; else gudang3 += g;
     modalStok += b.modalStok;
   });
+  var stok = {};
+  KELAS.forEach(function (k) {
+    var pcsK = 0;
+    batches.forEach(function (b) { if (b.kelas === k) pcsK += Math.max(0, b.gudang); });
+    stok[k] = { pcs: pcsK, renc: Math.floor(pcsK / ISI), sisaPcs: pcsK % ISI };
+  });
   var piutang = 0;
   pickups.forEach(function (p) { piutang += p.pend - p.setoran; });
 
@@ -1381,7 +1481,7 @@ function buildModel(data, today) {
     today: today, warung: warung, wMap: wMap, wStats: wStats, batches: batches, bMap: bMap,
     titipan: titipan, pickups: pickups, aktif: aktif, biaya: biayaRows, feeRef: feeRef,
     hasKelas5: batches.some(function (b) { return b.kelas === 5000; }),
-    stokW3: stokW3, stokW5: stokW5, rencW: rencW, gudang3: gudang3, gudang5: gudang5, modalStok: modalStok,
+    stokW3: stokW3, stokW5: stokW5, rencW: rencW, gudang3: gudang3, gudang5: gudang5, modalStok: modalStok, stok: stok,
     piutang: piutang, firstDate: firstDate, sampleCount: sampleCount
   };
 }
@@ -1393,6 +1493,73 @@ function batchSiap(model) {
     if (a.kelas !== b.kelas) return a.kelas - b.kelas;
     return a.nomor - b.nomor;
   });
+}
+
+/* Kelas harga yang stok gudangnya cukup untuk sedikitnya satu rencengan (gabungan semua belanja kelas itu) */
+function kelasSiap(model) {
+  return KELAS.filter(function (k) { return model.stok[k] && model.stok[k].renc >= 1; });
+}
+
+/* Urutan pemakaian stok: belanja tertua dulu */
+function urutFIFO(a, b) {
+  if (a.tanggal !== b.tanggal) return a.tanggal < b.tanggal ? -1 : 1;
+  if (a.nomor !== b.nomor) return a.nomor - b.nomor;
+  var d = num((a.raw || {}).dibuat) - num((b.raw || {}).dibuat);
+  if (d) return d;
+  return idStr(a.id) < idStr(b.id) ? -1 : idStr(a.id) > idStr(b.id) ? 1 : 0;
+}
+
+/* Stok yang dilepas bila sebuah titipan yang masih di warung diubah atau dihapus: {idBatch: pcs} */
+function lepasDari(t) {
+  var o = {};
+  if (t && t.status === 'aktif') (t.alokasi || []).forEach(function (a) { o[a.b] = (o[a.b] || 0) + a.pcs; });
+  return o;
+}
+
+/* Menentukan dari belanja mana saja `pcs` mainan kelas `kelas` diambil: tertua dulu (FIFO).
+   opt.tanggal: hanya belanja pada atau sebelum tanggal itu yang boleh dipakai.
+   opt.lepas: stok yang dilepas titipan yang sedang diubah (lihat lepasDari).
+   Hasil: alokasi [{b, pcs}], tersedia (pcs yang bisa dipakai), kurang (pcs yang belum terpenuhi), ok, modal, hppRata. */
+function alokasiFIFO(model, kelas, pcs, opt) {
+  opt = opt || {};
+  var lepas = opt.lepas || {}, tgl = opt.tanggal || '';
+  var need = Math.max(0, Math.round(num(pcs))), want = need, tersedia = 0, modal = 0, out = [];
+  model.batches.filter(function (b) {
+    return b.kelas === Number(kelas) && b.pcs > 0 && (!tgl || b.tanggal <= tgl);
+  }).sort(urutFIFO).forEach(function (b) {
+    var free = Math.max(0, b.gudang + (lepas[b.id] || 0));
+    tersedia += free;
+    if (need > 0 && free > 0) {
+      var take = Math.min(free, need);
+      out.push({ b: b.id, pcs: take }); need -= take; modal += take * b.perPcs;
+    }
+  });
+  var got = want - need;
+  return { alokasi: out, tersedia: tersedia, kurang: need, ok: want > 0 && need === 0, pcs: got, modal: Math.round(modal), hppRata: got > 0 ? modal / got : 0 };
+}
+
+/* Pengaman: apakah mengubah titipan `id` menjadi `doc` (atau menghapusnya bila doc null) membuat stok sebuah batch
+   menjadi minus, atau lebih minus dari sebelumnya? Contohnya membatalkan pengambilan yang sisanya sudah dititip lagi.
+   Mengembalikan daftar {batch, minus}; kosong berarti aman. */
+function stokMinusBaru(data, today, id, doc) {
+  var before = buildModel(data, today);
+  var titip = (data.titipan || []).filter(function (t) { return t.id !== id; });
+  if (doc) titip.push(Object.assign({}, doc, { id: id }));
+  var after = buildModel(Object.assign({}, data, { titipan: titip }), today), out = [];
+  after.batches.forEach(function (b) {
+    var a = before.bMap[b.id];
+    if (b.gudang < 0 && (!a || b.gudang < a.gudang)) out.push({ batch: b, minus: -b.gudang });
+  });
+  return out;
+}
+
+/* Hasil hitung pengambilan sebuah titipan bila sisa, rusak, dan bagian warung yang diisi adalah ini (untuk formulir) */
+function hitungAmbil(model, t, sisa, rusak, bagian, setoran) {
+  var si = clamp(Math.round(num(sisa)), 0, t.pcs), ru = clamp(Math.round(num(rusak)), 0, t.pcs - si);
+  var lapis = bagiLapis(t.alokasi, model.bMap, { done: true, pcs: t.pcs, sisa: si, rusak: ru, kelas: t.kelas, bagian: Math.max(0, Math.round(num(bagian))), setoran: num(setoran) });
+  var o = { lapis: lapis, hppT: 0, rugi: 0 };
+  lapis.forEach(function (s) { o.hppT += s.hppT; o.rugi += s.rugi; });
+  return o;
 }
 
 function inRange(d, from, to) { return d >= from && d <= to; }
@@ -1477,7 +1644,8 @@ function buildBridge(s, opt) {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    KELAS: KELAS, ISI: ISI, buildModel: buildModel, batchSiap: batchSiap, summarize: summarize, buildSeries: buildSeries, buildBridge: buildBridge,
+    KELAS: KELAS, ISI: ISI, buildModel: buildModel, batchSiap: batchSiap, kelasSiap: kelasSiap, alokasiFIFO: alokasiFIFO, lepasDari: lepasDari,
+    hitungAmbil: hitungAmbil, stokMinusBaru: stokMinusBaru, bagiBulat: bagiBulat, bacaAlokasi: bacaAlokasi, urutFIFO: urutFIFO, summarize: summarize, buildSeries: buildSeries, buildBridge: buildBridge,
     periodRange: periodRange, warungFee: warungFee, feeFor: feeFor, niceScale: niceScale, axisLabel: axisLabel, rp: rp, weekStart: weekStart,
     addDays: addDays, addMonths: addMonths, monthEnd: monthEnd, fmtPct: fmtPct, relDays: relDays, fmtDate: fmtDate, rangeLabel: rangeLabel,
     isYMD: isYMD
@@ -1655,7 +1823,7 @@ function onboardingCard() {
   var m = S.model;
   var steps = [
     { done: m.warung.length > 0, text: 'Tambah warung tempat kamu menitip', btn: 'Tambah warung', act: function () { openWarung(); } },
-    { done: m.batches.length > 0, text: 'Catat belanja pertama. Tiap belanja menjadi satu batch.', btn: 'Catat belanja', act: function () { openHpp(); } },
+    { done: m.batches.length > 0, text: 'Catat belanja pertama. Tiap belanja punya HPP sendiri yang tercatat tetap.', btn: 'Catat belanja', act: function () { openHpp(); } },
     { done: m.titipan.length > 0, text: 'Titip rencengan pertama di warung', btn: 'Titip rencengan', act: function () { openTitip(); } }
   ];
   if (steps.every(function (s) { return s.done; }) || !canW()) return null;
@@ -1689,7 +1857,7 @@ function heroCard(s) {
       'Sudah dipotong bagian warung, modal mainan yang terjual, dan biaya.'));
   }
   card.appendChild(h('p', { class: 'note', style: 'margin-top:6px' },
-    'Penjualan dicatat saat rencengan diambil dari warung, memakai modal batch yang dipilih saat menitip. Laba tiap batch ada di menu Belanja.'));
+    'Penjualan dicatat saat rencengan diambil dari warung. Modalnya memakai HPP tiap batch asal mainan (batch tertua dipakai dulu). Laba tiap batch ada di menu Belanja.'));
   if (s.noHpp > 0) {
     card.appendChild(alertBox('', '!', [
       h('b', null, s.noHpp + ' pengambilan belum punya HPP. '),
@@ -1715,7 +1883,7 @@ function berandaTiles(s) {
   var nBelum = Object.keys(m.wStats).filter(function (id) { return m.wStats[id].piutang > 0; }).length;
   var stokPcs = m.stokW3 + m.stokW5;
   var gdPcs = m.gudang3 + m.gudang5;
-  var siap = m.batches.reduce(function (a, b) { return a + b.rencSiap; }, 0);
+  var siap = KELAS.reduce(function (a, k) { return a + (m.stok[k] ? m.stok[k].renc : 0); }, 0);
   wrap.appendChild(h('div', { class: 'tiles' },
     tile('Belum disetor warung', rp(m.piutang), nBelum > 0 ? nBelum + ' warung belum lunas' : 'Semua sudah lunas'),
     tile('Rencengan di warung', fmtNum(m.rencW), fmtNum(stokPcs) + ' pcs · nilai jual ' + rp(m.stokW3 * 3000 + m.stokW5 * 5000)),
@@ -1930,7 +2098,7 @@ function batchPill(b) {
   if (b.over) return pill('bad', '!', 'Stok minus');
   if (b.status === 'baru') return pill('flat', '○', 'Belum dititip');
   if (b.status === 'habis') return pill('good', '✓', 'Habis terjual');
-  if (b.status === 'sisa') return pill('warn', '!', 'Sisa ' + fmtNum(b.gudang) + ' pcs');
+  if (b.status === 'sisa') return pill('info', '●', 'Sisa ' + fmtNum(b.gudang) + ' pcs di gudang');
   return pill('info', '●', 'Berjalan');
 }
 function stockBar(b) {
@@ -1947,7 +2115,8 @@ function stockBar(b) {
   return [bar, leg];
 }
 function rencText(b) {
-  return b.kelipatan ? b.rencTotal + ' rencengan' : '≈ ' + b.rencTotal + ' rencengan (bukan kelipatan 50)';
+  var n = Math.round(b.pcs / ISI * 10) / 10;
+  return (b.kelipatan ? '' : '≈ ') + String(n).replace('.', ',') + ' rencengan';
 }
 function batchCard(b, tap) {
   var tag = h('span', { class: 'tag ' + (b.kelas === 3000 ? 'k3' : 'k5') }, 'Rp' + fmtNum(b.kelas));
@@ -2041,7 +2210,7 @@ function viewWarungSales() {
   var sudah = {};
   m.titipan.forEach(function (t) { sudah[t.warungId] = (sudah[t.warungId] || 0) + t.rencengan; });
   var belum = punya.filter(function (w) { return !sudah[w.id]; });
-  var siap = batchSiap(m);
+  var siap = kelasSiap(m);
   if (canW()) {
     box.appendChild(h('div', { class: 'acts' },
       h('button', { type: 'button', class: 'btn primary act', onclick: function () { openWarung(null, { onSaved: function (id) { openTitip({ warungId: id }); } }); } },
@@ -2286,18 +2455,18 @@ function viewKunjungan() {
   if (isSales()) return viewWarungSales();
   var m = S.model;
   var box = h('div', { class: 'stack' });
-  var siap = batchSiap(m);
+  var siap = kelasSiap(m);
   if (canW()) {
     box.appendChild(h('div', { class: 'acts' },
       h('button', { type: 'button', class: 'btn primary act', onclick: function () { openTitip(); } },
-        h('b', null, 'Titip rencengan baru'), h('small', null, 'Pilih warung dan batch')),
+        h('b', null, 'Titip rencengan baru'), h('small', null, siap.length ? 'Stok: ' + fmtNum(m.gudang3 + m.gudang5) + ' pcs di gudang' : 'Stok gudang belum cukup')),
       h('button', { type: 'button', class: 'btn act', disabled: m.aktif.length === 0, onclick: function () { openAmbil(); } },
         h('b', null, 'Ambil rencengan lama'), h('small', null, m.aktif.length ? 'Hitung sisa mainan' : 'Belum ada yang dititip'))));
     if (!m.batches.length) {
-      box.appendChild(alertBox('', '!', [h('b', null, 'Belum ada batch. '), 'Catat belanja dulu di menu Belanja. Tiap belanja menjadi satu batch yang bisa dititipkan. ',
+      box.appendChild(alertBox('', '!', [h('b', null, 'Belum ada belanja. '), 'Catat belanja dulu di menu Belanja. Mainan dari tiap belanja menjadi stok yang bisa dititipkan. ',
         h('button', { type: 'button', class: 'btn ghost sm', onclick: function () { openHpp(); } }, 'Catat belanja')]));
     } else if (!siap.length) {
-      box.appendChild(alertBox('', '!', [h('b', null, 'Stok gudang kurang dari satu rencengan. '), 'Catat belanja batch baru supaya bisa menitip lagi. ',
+      box.appendChild(alertBox('', '!', [h('b', null, 'Stok gudang kurang dari satu rencengan. '), 'Gabungan semua belanja belum sampai 50 mainan. Catat belanja baru supaya bisa menitip lagi. ',
         h('button', { type: 'button', class: 'btn ghost sm', onclick: function () { openHpp(); } }, 'Catat belanja')]));
     }
   }
@@ -2321,7 +2490,7 @@ function viewKunjungan() {
       else al.appendChild(h('div', { class: 'row' }, main, right));
     });
     ac.appendChild(al);
-    if (canW()) ac.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Perlu mengubah jumlah atau batch yang sudah dititip? Ubah lewat menu Ambil rencengan lama, lalu pilih “Ubah titipan”.'));
+    if (canW()) ac.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Perlu mengubah jumlah rencengan yang sudah dititip? Ubah lewat menu Ambil rencengan lama, lalu pilih “Ubah titipan”.'));
   }
   box.appendChild(ac);
 
@@ -2366,9 +2535,9 @@ function viewBelanja() {
     tile('Total belanja', rp(totalBelanja), m.batches.length + ' batch'),
     tile('Stok gudang', fmtNum(m.gudang3 + m.gudang5) + ' pcs', 'Di warung ' + fmtNum(m.stokW3 + m.stokW5) + ' pcs')));
   box.appendChild(h('p', { class: 'note' },
-    'Tiap belanja menjadi satu batch dengan HPP sendiri. Saat menitip kamu memilih batch, dan labanya dihitung dari HPP batch itu ketika rencengan diambil. Usahakan jumlah mainan tiap batch kelipatan 50 (1 rencengan = 50 mainan).'));
+    'Tiap belanja menjadi satu batch dengan HPP sendiri yang tetap dan tercatat. Saat menitip, mainan diambil dari batch tertua dulu, dan satu rencengan boleh berisi dua batch. Mainan yang tidak laku kembali ke batch asalnya dengan HPP yang sama. Jumlah mainan tiap belanja tidak harus kelipatan 50.'));
   if (!m.batches.length) {
-    box.appendChild(emptyBox('Belum ada batch', 'Catat belanja mainan dan bahan produksi. Setiap belanja otomatis menjadi batch baru, misalnya Rp3.000 · Batch 1.'));
+    box.appendChild(emptyBox('Belum ada batch', 'Catat belanja mainan dan bahan produksi. Setiap belanja otomatis menjadi batch baru dengan HPP sendiri, misalnya Rp3.000 · Batch 1.'));
     return box;
   }
   var wrap = h('div', { class: 'bstack' });
@@ -2406,8 +2575,8 @@ function openBatch(id) {
     var pillRow = h('div', { class: 'inline' }, batchPill(b));
     body.appendChild(pillRow);
     body.appendChild(h('div', { class: 'bstack' }, stockBar(b)));
-    if (b.over) body.appendChild(alertBox('bad', '!', 'Jumlah yang dititip melebihi isi batch ini, jadi stok minus. Periksa jumlah pcs batch atau jumlah rencengan yang dititip.'));
-    if (!b.kelipatan && b.pcs > 0) body.appendChild(alertBox('', '!', 'Jumlah mainan batch ini ' + fmtNum(b.pcs) + ' pcs, bukan kelipatan 50. Sisanya ' + (b.pcs % ISI) + ' pcs tidak cukup untuk satu rencengan penuh.'));
+    if (b.over) body.appendChild(alertBox('bad', '!', 'Jumlah yang dititip melebihi isi batch ini, jadi stok minus. Ini bisa terjadi kalau dua HP menitip dari stok yang sama saat belum tersambung internet, atau jumlah pcs belanja ini salah. Periksa titipan terbaru dari batch ini, lalu ubah atau hapus yang kelebihan.'));
+    if (b.gudang > 0 && b.status !== 'baru') body.appendChild(h('p', { class: 'note' }, 'Sisa ' + fmtNum(b.gudang) + ' pcs di gudang dipakai lebih dulu saat menitip, sebelum batch yang lebih baru.'));
 
     var doneN = b.titipan.filter(function (t) { return t.status === 'selesai'; }).length;
     if (doneN === 0) {
@@ -2446,7 +2615,7 @@ function openBatch(id) {
       t.appendChild(h('thead', null, h('tr', null, h('th', null, 'Warung'), h('th', { class: 'n' }, 'Pcs'), h('th', { class: 'n' }, 'Terjual'), h('th', { class: 'n' }, 'Laba kotor'))));
       var tb = h('tbody');
       b.titipan.forEach(function (x) {
-        var ket = x.status === 'aktif' ? 'Di warung sejak ' + fmtDay(x.tanggalTitip) : 'Diambil ' + fmtDay(x.tanggalAmbil);
+        var ket = (x.status === 'aktif' ? 'Di warung sejak ' + fmtDay(x.tanggalTitip) : 'Diambil ' + fmtDay(x.tanggalAmbil)) + (x.campur ? ' · bagian dari rencengan gabungan (' + fmtNum(x.totalPcs) + ' pcs)' : '');
         tb.appendChild(h('tr', null,
           h('td', null, x.warungNama, h('div', { class: 'hint' }, ket)),
           h('td', { class: 'n' }, fmtNum(x.pcs)),
@@ -2460,7 +2629,7 @@ function openBatch(id) {
   }, function (foot, api) {
     if (canW()) foot.appendChild(h('button', { type: 'button', class: 'btn', 'aria-label': 'Ubah belanja batch ini', onclick: function () { openHpp({ edit: b }); } }, 'Ubah'));
     foot.appendChild(h('button', { type: 'button', class: 'btn', onclick: api.close }, 'Tutup'));
-    if (canW() && b.rencSiap > 0) foot.appendChild(h('button', { type: 'button', class: 'btn primary', 'aria-label': 'Titip dari batch ini', onclick: function () { openTitip({ batchId: b.id }); } }, 'Titip dari batch'));
+    if (canW() && m.stok[b.kelas] && m.stok[b.kelas].renc > 0) foot.appendChild(h('button', { type: 'button', class: 'btn primary', 'aria-label': 'Titip rencengan Rp' + fmtNum(b.kelas), onclick: function () { openTitip({ kelas: b.kelas }); } }, 'Titip rencengan'));
   });
 }
 
@@ -2510,13 +2679,16 @@ function perWarung(s) {
 function perBatch(s) {
   var map = {};
   s.pickups.forEach(function (v) {
-    var key = v.batchId || '-';
-    var o = map[key] || (map[key] = {
-      label: v.batchLabel, kelas: v.kelas, nomor: v.batch ? v.batch.nomor : 0, n: 0, terjual: 0, rusak: 0,
-      omzet: 0, bagian: 0, hppT: 0, rugi: 0, labaKotor: 0
+    // Satu pengambilan bisa berisi beberapa batch: tiap batch menerima bagiannya sendiri
+    v.lapis.forEach(function (l) {
+      var key = l.batchId || '-';
+      var o = map[key] || (map[key] = {
+        label: l.batch ? l.batch.label : '(batch dihapus)', kelas: v.kelas, nomor: l.batch ? l.batch.nomor : 0, n: 0, terjual: 0, rusak: 0,
+        omzet: 0, bagian: 0, hppT: 0, rugi: 0, labaKotor: 0
+      });
+      o.n += 1; o.terjual += l.terjual; o.rusak += l.rusak; o.omzet += l.omzet; o.bagian += l.bagian;
+      o.hppT += l.hppT; o.rugi += l.rugi; o.labaKotor += l.labaKotor;
     });
-    o.n += 1; o.terjual += v.terjual; o.rusak += v.rusak; o.omzet += v.omzet; o.bagian += v.bagian;
-    o.hppT += v.hppT; o.rugi += v.rugi; o.labaKotor += v.labaKotor;
   });
   return Object.keys(map).map(function (k) { return map[k]; }).sort(function (a, b) {
     return a.kelas !== b.kelas ? a.kelas - b.kelas : a.nomor - b.nomor;
@@ -2996,19 +3168,25 @@ function guideSheet(title, text, actions) {
     });
   });
 }
+/* Ringkasan stok gudang per kelas harga, misalnya "Rp3.000 195 pcs (3 rencengan)" */
+function stokTeks(m) {
+  var p = KELAS.filter(function (k) { return m.stok[k] && m.stok[k].pcs > 0; }).map(function (k) {
+    return rp(k) + ' ' + fmtNum(m.stok[k].pcs) + ' pcs (' + m.stok[k].renc + ' rencengan)';
+  });
+  return p.length ? p.join(' · ') : 'kosong';
+}
 /* Setelah rencengan diambil atau warung baru dibuat: tawarkan langsung menitip rencengan baru */
 function offerTitip(warungId, intro) {
   computeModel();
   var m = S.model, w = m.wMap[warungId];
   if (!w || !canW() || isSales()) return;
-  var siap = batchSiap(m);
+  var siap = kelasSiap(m);
   openSheet('Titip rencengan baru?', function (body) {
     body.appendChild(h('p', { class: 'note', style: 'font-size:15px' }, intro + ' '));
     if (siap.length) {
-      var b = siap[0];
-      body.appendChild(h('p', { class: 'note', style: 'font-size:15px' }, 'Mau langsung menitip rencengan baru di ', h('b', null, w.nama), '? Batch tertua yang stoknya cukup: ', h('b', null, b.label), ' (gudang ' + fmtNum(b.gudang) + ' pcs).'));
+      body.appendChild(h('p', { class: 'note', style: 'font-size:15px' }, 'Mau langsung menitip rencengan baru di ', h('b', null, w.nama), '? Stok gudang: ', h('b', null, stokTeks(m)), '. Mainan diambil dari belanja tertua dulu.'));
     } else {
-      body.appendChild(h('p', { class: 'note', style: 'font-size:15px' }, 'Stok gudang sudah kurang dari satu rencengan. Catat belanja batch baru dulu sebelum menitip lagi di ', h('b', null, w.nama), '.'));
+      body.appendChild(h('p', { class: 'note', style: 'font-size:15px' }, 'Stok gudang sudah kurang dari satu rencengan (50 mainan). Catat belanja baru dulu sebelum menitip lagi di ', h('b', null, w.nama), '.'));
     }
   }, function (foot, api) {
     foot.appendChild(h('button', { type: 'button', class: 'btn', onclick: api.close }, 'Nanti saja'));
@@ -3025,6 +3203,7 @@ function openTitip(opts) {
   var m = S.model, edit = opts.edit ? (findBy(m.titipan, opts.edit.id) || opts.edit) : null;
   var kar = isSales(), me = aku();
   if (kar) edit = null; // sales hanya menitip rencengan pertama, tidak mengubah titipan
+  if (edit && edit.status !== 'aktif') edit = null;
 
   // Warung yang boleh dipilih: belum punya rencengan yang masih di warung.
   // Untuk sales: hanya warung miliknya yang belum pernah dititipi.
@@ -3034,14 +3213,14 @@ function openTitip(opts) {
     if (kar) return !!me && w.oleh === me.id && !m.titipan.some(function (t) { return t.warungId === w.id; });
     return (w.status !== 'nonaktif' && !busyW[w.id]) || (edit && edit.warungId === w.id);
   });
-  var blist = batchSiap(m);
-  if (edit && edit.batch && blist.indexOf(edit.batch) < 0) blist.push(edit.batch);
+  var ks = kelasSiap(m);
+  if (edit && ks.indexOf(edit.kelas) < 0) ks.push(edit.kelas);
 
-  if (!m.batches.length || (!blist.length && !edit)) {
+  if (!m.batches.length || (!ks.length && !edit)) {
     guideSheet('Titip rencengan baru',
       kar ? 'Belum ada stok untuk dititip. Kabari pemilik atau admin supaya belanja dicatat dulu.'
-        : !m.batches.length ? 'Belum ada batch. Catat belanja dulu; tiap belanja menjadi satu batch yang bisa dititipkan.'
-        : 'Stok gudang tiap batch kurang dari satu rencengan (50 mainan). Catat belanja batch baru supaya bisa menitip lagi.',
+        : !m.batches.length ? 'Belum ada belanja. Catat belanja dulu; mainan dari belanja itu menjadi stok yang bisa dititipkan.'
+        : 'Stok gudang (gabungan semua belanja) kurang dari satu rencengan, yaitu 50 mainan. Catat belanja baru supaya bisa menitip lagi.',
       kar ? [] : [{ label: 'Catat belanja', primary: true, run: function () { openHpp(); } }]);
     return;
   }
@@ -3059,74 +3238,111 @@ function openTitip(opts) {
     return;
   }
 
+  var kelas = edit ? edit.kelas : (opts.kelas && ks.indexOf(opts.kelas) >= 0 ? opts.kelas : ks[0]);
   var f = {};
   f.tgl = h('input', { type: 'date', class: 'inp', value: edit ? edit.tanggalTitip : (opts.tgl || S.today), required: true });
   f.war = h('select', { class: 'inp' }, choices.map(function (w) { return h('option', { value: w.id }, w.nama); }));
   var wid0 = edit ? edit.warungId : (opts.warungId && choices.some(function (w) { return w.id === opts.warungId; }) ? opts.warungId : choices[0].id);
   f.war.value = wid0;
-  f.bat = h('select', { class: 'inp' }, blist.map(function (b) {
-    var gud = b.gudang + (edit && edit.batchId === b.id ? edit.pcs : 0);
-    return h('option', { value: b.id }, b.label + ' · ' + fmtNum(gud) + ' pcs');
-  }));
-  var bid0 = edit ? edit.batchId : (opts.batchId && blist.some(function (b) { return b.id === opts.batchId; }) ? opts.batchId : blist[0].id);
-  f.bat.value = bid0;
   f.renc = mkNum(edit ? edit.rencengan : (opts.renc || 1), '1');
   f.renc.setAttribute('min', '1');
   f.catatan = h('textarea', { class: 'inp', rows: '2', maxlength: '300', placeholder: 'Opsional' });
   if (edit && edit.catatan) f.catatan.value = edit.catatan;
   f.info = h('div', { class: 'calc', 'aria-live': 'polite' });
+  f.rinci = h('div', { class: 'sumrows', 'aria-live': 'polite' });
   f.warHint = h('div', { class: 'hint', 'aria-live': 'polite' });
-  f.batHint = h('div', { class: 'hint', 'aria-live': 'polite' });
+  f.stokHint = h('div', { class: 'hint', 'aria-live': 'polite' });
+  var kelasHost = h('div');
+  function drawKelas() {
+    kelasHost.textContent = '';
+    if (edit || ks.length < 2) {
+      kelasHost.appendChild(h('span', { class: 'tag ' + (kelas === 3000 ? 'k3' : 'k5') }, 'Rp' + fmtNum(kelas)));
+      kelasHost.appendChild(h('span', { class: 'hint' }, edit ? ' Harga jual tidak bisa diubah di titipan yang sudah ada.' : ' Hanya kelas ini yang stoknya cukup.'));
+    } else {
+      kelasHost.appendChild(seg(ks.map(function (k) { return { key: k, label: 'Rp' + fmtNum(k) }; }), kelas, function (k) { kelas = k; drawKelas(); refresh(); }, 'Kelas harga jual'));
+    }
+  }
 
+  /* Dari belanja mana mainan diambil: tertua dulu (FIFO). Titipan yang sedang diubah melepas stoknya sendiri dulu. */
   function calc() {
-    var b = m.bMap[f.bat.value] || null;
-    var renc = ni(f.renc), pcs = renc * ISI;
-    var avail = b ? b.gudang + (edit && edit.batchId === b.id ? edit.pcs : 0) : 0;
+    var renc = ni(f.renc), pcs = renc * ISI, tgl = isYMD(f.tgl.value) ? f.tgl.value : '';
+    var lepas = edit && edit.kelas === kelas ? lepasDari(edit) : {};
+    var r = alokasiFIFO(m, kelas, pcs, { tanggal: tgl, lepas: lepas });
+    var al = r.alokasi, modal = r.modal, keep = false;
+    if (edit && edit.kelas === kelas && pcs > 0 && pcs === edit.pcs) {
+      // Jumlah tidak berubah: asal mainan yang sudah tercatat dipertahankan selama belanjanya masih ada dan tidak lebih baru dari tanggal titip
+      var oke = edit.alokasi.every(function (a) { var b = m.bMap[a.b]; return b && (!tgl || b.tanggal <= tgl); });
+      if (oke) {
+        keep = true; al = edit.alokasi; modal = 0;
+        al.forEach(function (a) { modal += a.pcs * m.bMap[a.b].perPcs; });
+        modal = Math.round(modal);
+      }
+    }
     return {
-      b: b, renc: renc, pcs: pcs, avail: avail, max: Math.floor(Math.max(0, avail) / ISI),
-      modal: b ? Math.round(pcs * b.perPcs) : 0, jual: b ? pcs * b.kelas : 0, bad: !b || renc < 1 || pcs > avail
+      renc: renc, pcs: pcs, tgl: tgl, al: al, modal: modal, keep: keep, tersedia: r.tersedia, max: Math.floor(r.tersedia / ISI),
+      jual: pcs * kelas, hppRata: pcs > 0 ? modal / pcs : 0, bad: renc < 1 || (!keep && !r.ok)
     };
   }
+  function awalBeli() {
+    var d = '';
+    m.batches.forEach(function (b) { if (b.kelas === kelas && b.pcs > 0 && (!d || b.tanggal < d)) d = b.tanggal; });
+    return d;
+  }
   function refresh() {
-    var c = calc(), b = c.b;
-    f.batHint.textContent = b ? 'Stok gudang ' + b.label + ': ' + fmtNum(c.avail) + ' pcs, cukup untuk ' + c.max + ' rencengan.' + (kar ? '' : ' HPP ' + rp(b.perPcs) + ' per pcs.') : '';
+    var c = calc();
+    f.stokHint.textContent = 'Stok gudang Rp' + fmtNum(kelas) + (c.tgl ? ' pada ' + fmtDate(c.tgl) : '') + ': ' + fmtNum(c.tersedia) + ' pcs, cukup untuk ' + c.max + ' rencengan.';
     f.info.textContent = '';
-    f.info.className = 'calc' + (c.bad && b ? ' err' : '');
-    if (!b) { f.info.appendChild(document.createTextNode('Pilih batch.')); return; }
-    if (c.renc < 1) { f.info.appendChild(document.createTextNode('Isi jumlah rencengan, minimal 1.')); return; }
-    if (c.pcs > c.avail) {
+    f.rinci.textContent = '';
+    f.info.className = 'calc' + (c.bad && c.renc >= 1 ? ' err' : '');
+    var w = m.wMap[f.war.value];
+    f.warHint.textContent = w ? 'Bagian ' + w.nama + ': ' + rp(feeFor(w, kelas)) + ' per mainan terjual.' : '';
+    if (c.renc < 1) { f.info.appendChild(document.createTextNode('Isi jumlah rencengan, minimal 1.')); markBad(f.renc, true); return; }
+    if (c.bad) {
+      var awal = awalBeli();
       f.info.appendChild(h('b', null, 'Stok tidak cukup: '));
-      f.info.appendChild(document.createTextNode(b.label + ' hanya punya ' + fmtNum(c.avail) + ' pcs di gudang, cukup untuk ' + c.max + ' rencengan.'));
+      f.info.appendChild(document.createTextNode(
+        c.tgl && awal && c.tgl < awal ? 'belum ada belanja Rp' + fmtNum(kelas) + ' pada atau sebelum ' + fmtDate(c.tgl) + ' (belanja pertama ' + fmtDate(awal) + '). Ubah tanggal titip.'
+          : 'stok Rp' + fmtNum(kelas) + ' hanya ' + fmtNum(c.tersedia) + ' pcs, cukup untuk ' + c.max + ' rencengan. Kurangi jumlah rencengan atau catat belanja baru.'));
       markBad(f.renc, true);
       return;
     }
     markBad(f.renc, false);
     f.info.appendChild(h('b', null, c.renc + ' rencengan = ' + fmtNum(c.pcs) + ' pcs'));
-    f.info.appendChild(document.createTextNode((kar ? '' : '. Modal ' + rp(c.modal) + ' (HPP ' + rp(b.perPcs) + ' per pcs). Kalau laku semua, omzet ' + rp(c.jual)) + '. Stok gudang ' + b.label + ' setelah ini: ' + fmtNum(c.avail - c.pcs) + ' pcs.'));
-    var w = m.wMap[f.war.value];
-    f.warHint.textContent = w ? 'Bagian ' + w.nama + ': ' + rp(feeFor(w, b.kelas)) + ' per mainan terjual.' : '';
+    f.info.appendChild(document.createTextNode(kar ? '. Mainan diambil dari belanja tertua dulu.'
+      : (c.al.length > 1 ? '. Rencengan gabungan dari ' + c.al.length + ' belanja' : '. Dari satu belanja') + ', HPP rata-rata ' + rp(c.hppRata) + ' per pcs. Kalau laku semua, omzet ' + rp(c.jual) + '.'));
+    if (!kar) {
+      c.al.forEach(function (a) {
+        var b = m.bMap[a.b];
+        f.rinci.appendChild(h('div', null, h('span', null, b ? b.label : '(batch dihapus)'), h('span', null, fmtNum(a.pcs) + ' pcs × ' + rp(b ? b.perPcs : 0))));
+      });
+      f.rinci.appendChild(h('div', { class: 'big' }, h('span', null, 'Modal rencengan ini'), h('span', null, rp(c.modal))));
+    }
+    f.stokHint.textContent += ' Setelah ini sisa ' + fmtNum(Math.max(0, c.tersedia - c.pcs)) + ' pcs.';
   }
-  [f.renc].forEach(function (el) { el.addEventListener('input', refresh); });
-  f.bat.addEventListener('change', refresh);
+  f.renc.addEventListener('input', refresh);
+  f.tgl.addEventListener('change', refresh);
+  f.tgl.addEventListener('input', refresh);
   f.war.addEventListener('change', refresh);
 
   var addWar = h('button', { type: 'button', class: 'btn ghost sm', onclick: function () {
-    var keep = { batchId: f.bat.value, renc: ni(f.renc) || 1, tgl: f.tgl.value };
-    openWarung(null, { onSaved: function (id) { openTitip({ warungId: id, batchId: keep.batchId, renc: keep.renc, tgl: keep.tgl }); } });
+    var keep = { kelas: kelas, renc: ni(f.renc) || 1, tgl: f.tgl.value };
+    openWarung(null, { onSaved: function (id) { openTitip({ warungId: id, kelas: keep.kelas, renc: keep.renc, tgl: keep.tgl }); } });
   } }, '+ Warung baru');
 
+  drawKelas();
   openSheet(edit ? 'Ubah titipan' : 'Titip rencengan baru', function (body) {
-    body.appendChild(h('div', { class: 'note' }, edit ? 'Ubah catatan rencengan yang sedang ada di warung.' : kar ? 'Rencengan pertama yang kamu tinggal di warung baru.' : 'Rencengan baru yang kamu tinggal di warung. Laba dihitung nanti saat rencengannya diambil.'));
+    body.appendChild(h('div', { class: 'note' }, edit ? 'Ubah rencengan yang sedang ada di warung.' : kar ? 'Rencengan pertama yang kamu tinggal di warung baru.' : 'Rencengan baru yang kamu tinggal di warung. Laba dihitung nanti saat rencengannya diambil.'));
     body.appendChild(fieldEl('Tanggal titip', f.tgl));
     var warField = fieldEl('Warung', f.war);
     warField.appendChild(f.warHint);
     if (!edit) warField.appendChild(h('div', null, addWar));
     body.appendChild(warField);
-    var batField = fieldEl('Batch', f.bat, kar ? 'Pilih batch yang dititip. Yang tertua ada di atas.' : 'HPP batch yang dipilih dipakai untuk menghitung laba. Yang tertua ada di atas.');
-    batField.appendChild(f.batHint);
-    body.appendChild(batField);
-    body.appendChild(fieldEl('Jumlah rencengan', stepper(f.renc, 1), '1 rencengan = ' + ISI + ' mainan', f.renc));
+    body.appendChild(h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'Untuk mainan harga'), kelasHost));
+    var rf = fieldEl('Jumlah rencengan', stepper(f.renc, 1), '1 rencengan = ' + ISI + ' mainan. Mainan diambil dari belanja tertua dulu; satu rencengan boleh berisi dua belanja.', f.renc);
+    rf.appendChild(f.stokHint);
+    body.appendChild(rf);
     body.appendChild(f.info);
+    if (!kar) body.appendChild(f.rinci);
     body.appendChild(fieldEl('Catatan', f.catatan));
     refresh();
   }, function (foot, api) {
@@ -3137,27 +3353,45 @@ function openTitip(opts) {
       var mm = S.model, c = calc(), err = [];
       if (!isYMD(f.tgl.value)) err.push('Tanggal belum diisi.');
       if (!f.war.value) err.push('Pilih warung.');
-      if (!c.b) err.push('Pilih batch.');
       if (c.renc < 1) { err.push('Isi jumlah rencengan, minimal 1.'); markBad(f.renc, true); }
-      else if (c.b && c.pcs > c.avail) { err.push(c.b.label + ' hanya cukup untuk ' + c.max + ' rencengan (' + fmtNum(c.avail) + ' pcs di gudang).'); markBad(f.renc, true); }
-      if (c.b && isYMD(f.tgl.value) && f.tgl.value < c.b.tanggal) err.push(c.b.label + ' dibeli ' + fmtDate(c.b.tanggal) + ', jadi tanggal titip tidak boleh lebih awal.');
+      else if (c.bad) {
+        var awal = awalBeli();
+        err.push(c.tgl && awal && c.tgl < awal ? 'Belum ada belanja Rp' + fmtNum(kelas) + ' pada atau sebelum ' + fmtDate(c.tgl) + '. Belanja pertama ' + fmtDate(awal) + ', jadi tanggal titip tidak boleh lebih awal.'
+          : 'Stok Rp' + fmtNum(kelas) + ' hanya cukup untuk ' + c.max + ' rencengan (' + fmtNum(c.tersedia) + ' pcs di gudang).');
+        markBad(f.renc, true);
+      }
       var taken = mm.aktif.some(function (a) { return a.warungId === f.war.value && (!edit || a.id !== edit.id); });
       if (taken) err.push('Warung ini masih punya rencengan yang belum diambil. Ambil dulu rencengan lama.');
+      if (!c.bad && c.al.length > 100) err.push('Rencengan ini berasal dari ' + c.al.length + ' belanja kecil, terlalu banyak untuk dicatat. Kurangi jumlah rencengan, atau gabungkan belanja kecil lewat menu Belanja.');
       if (err.length) { api.setErrors(err); return; }
       api.setErrors([]);
       var data = {
-        warung: f.war.value, batch: c.b.id, kelas: c.b.kelas, rencengan: c.renc, pcs: c.pcs, tanggalTitip: f.tgl.value,
+        warung: f.war.value, batch: c.al[0].b, kelas: kelas, rencengan: c.renc, pcs: c.pcs,
+        alokasi: c.al.map(function (a) { return { b: a.b, pcs: a.pcs }; }), tanggalTitip: f.tgl.value,
         catatan: f.catatan.value.trim(), dibuat: edit ? num(edit.raw.dibuat) || Date.now() : Date.now()
       };
       var wNama = (mm.wMap[f.war.value] || {}).nama || 'warung';
+      var asal = c.al.length > 1 ? 'dari ' + c.al.length + ' belanja' : 'dari ' + (mm.bMap[c.al[0].b] ? mm.bMap[c.al[0].b].label : 'satu belanja');
       var done = busy(save);
       persist('titipan', edit ? edit.id : null, data).then(function () {
         closeSheet();
-        toast(edit ? 'Titipan diperbarui.' : 'Dititip: ' + c.renc + ' rencengan (' + fmtNum(c.pcs) + ' pcs) di ' + wNama + ', dari ' + c.b.label + '.');
+        toast(edit ? 'Titipan diperbarui.' : 'Dititip: ' + c.renc + ' rencengan (' + fmtNum(c.pcs) + ' pcs) di ' + wNama + ', ' + (kar ? 'dari stok gudang.' : asal + '.'));
       }, function (e) { done(); writeFail(api, e); });
     } }, edit ? 'Simpan perubahan' : 'Simpan titipan');
     foot.appendChild(save);
   });
+}
+
+/* Pengaman stok: kalau titipan `id` diubah menjadi `doc` (atau dibatalkan pengambilannya), apakah ada batch yang jadi minus?
+   Mengembalikan kalimat peringatan, atau '' kalau aman. */
+function peringatanStok(id, doc) {
+  var minus = stokMinusBaru({
+    warung: cleanDocs('warung', S.raw.warung), hpp: cleanDocs('hpp', S.raw.hpp),
+    titipan: cleanDocs('titipan', S.raw.titipan), biaya: cleanDocs('pengeluaran', S.raw.pengeluaran)
+  }, S.today, id, doc);
+  if (!minus.length) return '';
+  return 'Perubahan ini membuat stok ' + minus.map(function (x) { return x.batch.label + ' minus ' + fmtNum(x.minus) + ' pcs'; }).join(' dan ') +
+    ', karena sisa mainan dari pengambilan ini sudah dititip lagi. Ambil dulu rencengan yang memakai stok itu, baru ubah pengambilan ini.';
 }
 
 /* ===== Form: ambil rencengan lama ===== */
@@ -3222,8 +3456,11 @@ function openAmbil(opts) {
     if (!touched.bagian) f.bagian.value = String(o.saran);
     o.bagian = ni(f.bagian);
     o.pend = o.omzet - o.bagian;
-    o.hppT = Math.round(tj * t.h);
-    o.rugi = Math.round(ru * t.h);
+    // HPP dihitung per belanja asal mainan: sisa, rusak, dan terjual dibagi ke tiap lapis (lihat bagiLapis)
+    var hs = hitungAmbil(S.model, t, si, ru, o.bagian, 0);
+    o.hppT = hs.hppT;
+    o.rugi = hs.rugi;
+    o.lapis = hs.lapis;
     o.laba = o.pend - o.hppT - o.rugi;
     return o;
   }
@@ -3233,7 +3470,10 @@ function openAmbil(opts) {
     f.info.appendChild(h('h3', null, t.warungNama + ' · ' + t.batchLabel));
     f.info.appendChild(h('p', { class: 'note' },
       'Dititip ' + fmtDate(t.tanggalTitip) + (t.hari > 0 ? ' (' + t.hari + ' hari lalu)' : ' (hari ini)') + ' · ' + t.rencengan + ' rencengan = ' + fmtNum(t.pcs) + ' pcs. ' +
-      'HPP ' + rp(t.h) + ' per pcs. Bagian warung ' + rp(feeFor(m.wMap[t.warungId], t.kelas)) + ' per mainan terjual.'));
+      (t.campur
+        ? 'Rencengan gabungan: ' + t.lapis.map(function (s) { return (s.batch ? 'Batch ' + s.batch.nomor : 'batch dihapus') + ' ' + fmtNum(s.pcs) + ' pcs (HPP ' + rp(s.h) + ')'; }).join(' + ') + '; HPP rata-rata ' + rp(t.h) + ' per pcs. '
+        : 'HPP ' + rp(t.h) + ' per pcs. ') +
+      'Bagian warung ' + rp(feeFor(m.wMap[t.warungId], t.kelas)) + ' per mainan terjual.'));
     if (!edit) f.info.appendChild(h('button', { type: 'button', class: 'btn ghost sm', style: 'margin-top:4px', onclick: function () { openTitip({ edit: t }); } }, 'Ubah titipan ini'));
   }
   function refresh() {
@@ -3250,7 +3490,10 @@ function openAmbil(opts) {
       f.res.className = 'calc';
       f.res.appendChild(document.createTextNode('Terjual '));
       f.res.appendChild(h('b', null, c.tj + ' pcs'));
-      f.res.appendChild(document.createTextNode(' = ' + rp(c.omzet) + '. Sisa ' + c.si + ' pcs kembali ke stok ' + t.batchLabel + (c.ru > 0 ? '; ' + c.ru + ' pcs rusak atau hilang tidak kembali.' : '.')));
+      var kembaliKe = t.campur
+        ? 'batch asalnya (' + c.lapis.filter(function (s) { return s.sisa > 0; }).map(function (s) { return s.sisa + ' pcs ke ' + (s.batch ? 'Batch ' + s.batch.nomor : 'batch dihapus'); }).join(', ') + ')'
+        : t.batchLabel;
+      f.res.appendChild(document.createTextNode(' = ' + rp(c.omzet) + '. Sisa ' + c.si + ' pcs kembali ke stok ' + kembaliKe + (c.ru > 0 ? '; ' + c.ru + ' pcs rusak atau hilang tidak kembali.' : '.')));
     }
     markBad(f.sisa, c.bad);
     var wNama = t.warungNama;
@@ -3293,6 +3536,8 @@ function openAmbil(opts) {
       if (lain) { armed = false; undoBtn.textContent = 'Batalkan pengambilan'; apiRef.setErrors(['Warung ini sudah punya rencengan baru di warung. Ambil dulu rencengan itu sebelum membatalkan pengambilan ini.']); return; }
       var base = Object.assign({}, edit.raw);
       delete base.id; delete base.tanggalAmbil; delete base.sisa; delete base.rusak; delete base.bagian; delete base.setoran;
+      var warnStok = peringatanStok(edit.id, base);
+      if (warnStok) { armed = false; undoBtn.textContent = 'Batalkan pengambilan'; apiRef.setErrors([warnStok]); return; }
       var done = busy(undoBtn, 'Membatalkan…');
       persist('titipan', edit.id, base).then(function () {
         closeSheet(); toast('Pengambilan dibatalkan. Rencengan kembali tercatat di warung.');
@@ -3339,6 +3584,10 @@ function openAmbil(opts) {
         tanggalAmbil: f.tgl.value, sisa: c.si, rusak: c.ru, bagian: c.bagian, setoran: ni(f.setoran),
         catatan: f.catatan.value.trim(), dibuat: num(t.raw.dibuat) || Date.now()
       });
+      if (edit) {
+        var warnStok = peringatanStok(t.id, data);
+        if (warnStok) { api.setErrors([warnStok]); return; }
+      }
       var done = busy(save);
       persist('titipan', t.id, data).then(function () {
         closeSheet();
@@ -3379,7 +3628,7 @@ function openHpp(opts) {
     kelasHost.textContent = '';
     if (pakai > 0) {
       kelasHost.appendChild(h('div', { class: 'tag ' + (kelas === 3000 ? 'k3' : 'k5') }, 'Rp' + fmtNum(kelas)));
-      kelasHost.appendChild(h('div', { class: 'hint' }, 'Batch ini sudah dipakai untuk menitip, jadi harga jualnya tidak bisa diubah.'));
+      kelasHost.appendChild(h('div', { class: 'hint' }, 'Belanja ini sudah dipakai untuk menitip, jadi harga jualnya tidak bisa diubah.'));
     } else {
       kelasHost.appendChild(seg([{ key: 3000, label: 'Rp3.000' }, { key: 5000, label: 'Rp5.000' }], kelas, function (k) { kelas = k; drawKelas(); refresh(); }, 'Kelas harga jual'));
     }
@@ -3390,16 +3639,12 @@ function openHpp(opts) {
     prev.textContent = '';
     prev.className = 'calc';
     if (pcs <= 0 || total <= 0) { prev.appendChild(document.createTextNode('Isi total belanja dan jumlah pcs untuk melihat HPP.')); return; }
-    prev.appendChild(document.createTextNode('HPP batch ini '));
+    prev.appendChild(document.createTextNode('HPP belanja ini '));
     prev.appendChild(h('b', null, rp(total / pcs) + ' per pcs'));
     prev.appendChild(document.createTextNode('. Untung kalau laku dengan bagian warung ' + rp(m.feeRef[kelas] || 0) + ': '));
     prev.appendChild(h('b', null, rp(kelas - (m.feeRef[kelas] || 0) - total / pcs) + ' per mainan'));
     prev.appendChild(document.createTextNode('. '));
-    if (pcs % ISI === 0) prev.appendChild(document.createTextNode(pcs / ISI + ' rencengan penuh.'));
-    else {
-      prev.appendChild(h('b', null, 'Bukan kelipatan ' + ISI + '. '));
-      prev.appendChild(document.createTextNode('Jadi ' + Math.floor(pcs / ISI) + ' rencengan penuh dan sisa ' + (pcs % ISI) + ' pcs. Usahakan kelipatan ' + ISI + ' supaya tidak ada sisa.'));
-    }
+    prev.appendChild(document.createTextNode('Sekitar ' + String(Math.round(pcs / ISI * 10) / 10).replace('.', ',') + ' rencengan. Tidak harus kelipatan ' + ISI + ': sisa mainan digabung dengan belanja berikutnya saat menitip.'));
   }
   ['belanja', 'bahan', 'pcs'].forEach(function (k) { f[k].addEventListener('input', refresh); });
   drawKelas();
@@ -3408,10 +3653,10 @@ function openHpp(opts) {
     body.appendChild(h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'Untuk mainan harga'), kelasHost, nomorBox));
     body.appendChild(fieldEl('Belanja mainan', moneyWrap(f.belanja), 'Total uang yang dipakai membeli mainan', f.belanja));
     body.appendChild(fieldEl('Bahan produksi', moneyWrap(f.bahan), 'Tali, plastik, label, dan sejenisnya. Boleh 0.', f.bahan));
-    body.appendChild(fieldEl('Jumlah mainan (pcs)', f.pcs, 'Usahakan kelipatan ' + ISI + ', karena 1 rencengan = ' + ISI + ' mainan' + (minPcs > 0 ? '. Minimal ' + fmtNum(minPcs) + ' pcs karena sebagian sudah dititip.' : '.')));
+    body.appendChild(fieldEl('Jumlah mainan (pcs)', f.pcs, 'Tidak harus kelipatan ' + ISI + ' (1 rencengan = ' + ISI + ' mainan). Sisa digabung dengan belanja berikutnya.' + (minPcs > 0 ? ' Minimal ' + fmtNum(minPcs) + ' pcs karena sebagian sudah dititip.' : '')));
     body.appendChild(prev);
     body.appendChild(fieldEl('Catatan', f.catatan));
-    if (edit && pakai > 0) body.appendChild(h('p', { class: 'note' }, 'Batch ini sudah dipakai ' + pakai + ' titipan, jadi tidak bisa dihapus. Mengubah nominal belanja akan mengubah HPP dan laba semua pengambilan dari batch ini.'));
+    if (edit && pakai > 0) body.appendChild(h('p', { class: 'note' }, 'Belanja ini sudah dipakai ' + pakai + ' titipan, jadi tidak bisa dihapus. Mengubah nominal belanja akan mengubah HPP dan laba semua pengambilan dari belanja ini.'));
     refresh();
   }, function (foot, api) {
     if (edit && pakai === 0) deleteButton(foot, api, 'hpp', edit.id, 'Batch dihapus.');
@@ -3424,7 +3669,7 @@ function openHpp(opts) {
       else if (ni(f.pcs) < minPcs) err.push('Jumlah mainan tidak boleh kurang dari ' + fmtNum(minPcs) + ' pcs, karena segitu sudah dititip dan belum kembali.');
       if (edit && isYMD(f.tgl.value) && edit.titipan && edit.titipan.length) {
         var awal = edit.titipan.reduce(function (a, t) { return !a || t.tanggalTitip < a ? t.tanggalTitip : a; }, '');
-        if (awal && f.tgl.value > awal) err.push('Tanggal belanja tidak boleh lebih akhir dari tanggal titip pertama batch ini (' + fmtDate(awal) + ').');
+        if (awal && f.tgl.value > awal) err.push('Tanggal belanja tidak boleh lebih akhir dari tanggal titip pertama dari belanja ini (' + fmtDate(awal) + ').');
       }
       if (err.length) { api.setErrors(err); return; }
       api.setErrors([]);
