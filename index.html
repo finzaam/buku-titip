@@ -90,13 +90,18 @@ h1, h2, h3, p { margin: 0; }
 /* ---- Navigasi ---- */
 .nav {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
-  display: flex; gap: 2px; justify-content: center;
+  display: flex; gap: 2px; justify-content: flex-start;
+  overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; -webkit-overflow-scrolling: touch;
   padding: 6px max(10px, env(safe-area-inset-right, 0px)) calc(6px + env(safe-area-inset-bottom, 0px)) max(10px, env(safe-area-inset-left, 0px));
   background: var(--surface);
   border-top: 1px solid var(--border);
 }
+.nav::-webkit-scrollbar { display: none; }
+/* Tujuh menu tidak muat di HP kecil: tiap tombol punya lebar minimum dan barisnya bisa digeser. Margin auto di ujung menengahkan menu kalau muat. */
+.nav button:first-child { margin-left: auto; }
+.nav button:last-child { margin-right: auto; }
 .nav button {
-  flex: 1 1 0; max-width: 130px; min-width: 0;
+  flex: 1 0 66px; max-width: 130px; min-width: 66px;
   display: flex; flex-direction: column; align-items: center; gap: 2px;
   min-height: 52px; padding: 6px 4px;
   background: none; border: 0; border-radius: 12px; cursor: pointer;
@@ -109,7 +114,9 @@ h1, h2, h3, p { margin: 0; }
     position: sticky; top: env(safe-area-inset-top, 0px); bottom: auto; z-index: 20;
     justify-content: flex-start; gap: 6px; margin: 0 0 14px; padding: 6px; border: 1px solid var(--border); border-radius: 16px;
   }
-  .nav button { flex-direction: row; justify-content: center; gap: 8px; max-width: none; min-height: 44px; font-size: 14px; }
+  .nav button { flex: 0 0 auto; flex-direction: row; justify-content: center; gap: 8px; max-width: none; min-width: 0; min-height: 44px; padding: 6px 14px; font-size: 14px; }
+  .nav button:first-child { margin-left: 0; }
+  .nav button:last-child { margin-right: 0; }
   .app { padding-bottom: 48px; }
 }
 
@@ -382,6 +389,20 @@ button.bcard:hover { background: var(--surface-2); }
 .neg { color: var(--bad-ink); }
 .pill.info { background: var(--accent-soft); color: var(--accent); }
 .bstack { display: flex; flex-direction: column; gap: 10px; }
+/* ---- Menu Warung: kartu ringkas, teks dibatasi, daftar bertahap ---- */
+.clamp1, .clamp2 { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.clamp1 { -webkit-line-clamp: 1; line-clamp: 1; }
+.clamp2 { -webkit-line-clamp: 2; line-clamp: 2; }
+.wgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); gap: 10px; }
+.wcard { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); }
+.wcard.muted { background: var(--surface-2); }
+.wc-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.wc-t { font-weight: 650; min-width: 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+.wc-top .pill { flex: none; }
+.wc-s { font-size: 13px; color: var(--ink-2); min-width: 0; overflow-wrap: anywhere; }
+.wc-act { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.inp.cari { -webkit-appearance: none; appearance: none; }
+@media (max-width: 360px) { .grid2.logtgl { grid-template-columns: minmax(0, 1fr); } }
 </style>
 </head>
 <body>
@@ -417,7 +438,7 @@ button.bcard:hover { background: var(--surface-2); }
    - Kalau dihubungkan ke Google Sheet, setiap perubahan dikirim lewat antrean dan perubahan HP lain diambil tiap beberapa detik. */
 (function () {
   'use strict';
-  var APP_VERSI = 'v5'; // harus sama dengan VERSI di sw.js (build_pwa.sh memeriksanya)
+  var APP_VERSI = 'v6'; // harus sama dengan VERSI di sw.js (build_pwa.sh memeriksanya)
   var KEY = 'bukutitip.data.v1';
   var KEY_TERAKHIR = 'bukutitip.cadangan.terakhir';
   var KEY_CFG = 'bukutitip.sync.cfg';
@@ -1065,6 +1086,36 @@ button.bcard:hover { background: var(--surface-2); }
     }, function (err) { if (err && err.kode) gagal(err); throw err; });
   }
 
+  /* Log aktivitas (menu Log, pemilik dan admin): terbaru dulu, filter waktu dan karyawan, dimuat bertahap.
+     Skrip Apps Script lama belum punya aksi "log"; kalau begitu pakai aksi "jejak" lama (maksimal 100 aktivitas terbaru,
+     filter karyawan dilakukan di HP) dan beri tanda lama:true supaya layar menyarankan menempel skrip terbaru. */
+  function log(o) {
+    o = o || {};
+    if (!cfg || cfg.stop) return Promise.reject(new Error('Belum tersambung ke Google Sheet.'));
+    if (cfg.peran === 'sales') return Promise.reject(new Error('Tidak diizinkan.'));
+    var dari = Number(o.dari) || 0, sampai = Number(o.sampai) || (Date.now() + 60000), siapa = typeof o.siapa === 'string' ? o.siapa : '';
+    return post({ a: 'log', dari: dari, sampai: sampai, siapa: siapa, n: Number(o.n) || 50, sebelum: Number(o.sebelum) || 0 }).then(function (res) {
+      return { items: res.items || [], ringkas: res.ringkas || [], total: Number(res.total) || 0, lanjut: Number(res.lanjut) || 0, lama: false };
+    }, function (err) {
+      if (err && err.message === 'Server: aksi') {
+        return post({ a: 'jejak', dari: dari, sampai: sampai, n: 100 }).then(function (res) {
+          var items = (res.terbaru || []).filter(function (x) { return !siapa || x.siapa === siapa; });
+          var per = {};
+          (res.ringkas || []).forEach(function (x) {
+            if (siapa && x.siapa !== siapa) return;
+            if (!per[x.siapa]) per[x.siapa] = { siapa: x.siapa, nama: x.nama, n: 0 };
+            per[x.siapa].n += x.n;
+          });
+          var ringkas = Object.keys(per).map(function (k) { return per[k]; }).sort(function (a, b) { return b.n - a.n; });
+          var total = ringkas.reduce(function (a, x) { return a + x.n; }, 0);
+          return { items: items, ringkas: ringkas, total: total, lanjut: 0, lama: true };
+        });
+      }
+      if (err && err.kode) gagal(err);
+      throw err;
+    });
+  }
+
   window.addEventListener('storage', function (e) {
     if (e.key !== KEY) return;
     load();
@@ -1087,7 +1138,7 @@ button.bcard:hover { background: var(--surface-2); }
   window.claude = { use: function (name) { return Promise.resolve(({ db: db, user: user, downloads: downloads })[name] || null); } };
   api = window.__lokal = {
     card: card, salesCard: salesCard, versiCard: versiCard, versi: APP_VERSI, status: status, onStatus: null, onNotice: null,
-    peran: peran, aku: aku, jejak: jejak, kodePasangUntuk: kodePasangUntuk, tautanPasangUntuk: tautanPasangUntuk, salin: salin,
+    peran: peran, aku: aku, jejak: jejak, log: log, kodePasangUntuk: kodePasangUntuk, tautanPasangUntuk: tautanPasangUntuk, salin: salin,
     exportJson: exportJson, parseBackup: parseBackup, applyBackup: applyBackup,
     sambungkan: sambungkan, putuskan: putuskan, syncNow: syncOnce, kodePasang: kodePasang, bacaPasang: bacaPasang,
     setPoll: function (ms) { pollMs = ms; startLoop(); },
@@ -1695,14 +1746,16 @@ var COLL = ['warung', 'hpp', 'titipan', 'pengeluaran'].concat(window.__lokal ? [
 var TABS = [
   { key: 'beranda', label: 'Beranda', icon: 'M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10' },
   { key: 'kunjungan', label: 'Kunjungan', icon: 'M9 4h6l1 2h3v14H5V6h3zM9 13l2 2 4-4' },
+  { key: 'warung', label: 'Warung', icon: 'M4 9l1.5-5h13L20 9M4 9h16v11H4zM4 9a2.7 2.7 0 0 0 5.3 0 2.7 2.7 0 0 0 5.4 0A2.7 2.7 0 0 0 20 9M9.5 20v-5h5v5' },
   { key: 'belanja', label: 'Belanja', icon: 'M5 8h14l-1 12H6zM9 8V6a3 3 0 0 1 6 0v2' },
   { key: 'biaya', label: 'Biaya', icon: 'M6 3h12v18l-3-2-3 2-3-2-3 2zM9 8h6M9 12h6' },
-  { key: 'laporan', label: 'Laporan', icon: 'M5 20V11M12 20V4M19 20v-6' }
+  { key: 'laporan', label: 'Laporan', icon: 'M5 20V11M12 20V4M19 20v-6' },
+  { key: 'log', label: 'Log', icon: 'M5 4h14v16H5zM8.5 9h7M8.5 13h7M8.5 17h4' }
 ];
 /* Versi mandiri: HP sales hanya punya dua menu. Peran ditentukan server dari kode yang dipasang. */
 var TAB_SALES = [
   { key: 'kunjungan', label: 'Warung baru', icon: TABS[1].icon },
-  { key: 'performa', label: 'Performa', icon: TABS[4].icon }
+  { key: 'performa', label: 'Performa', icon: 'M5 20V11M12 20V4M19 20v-6' }
 ];
 function peranKu() { return window.__lokal && typeof window.__lokal.peran === 'function' ? window.__lokal.peran() : 'pemilik'; }
 function isSales() { return peranKu() === 'sales'; }
@@ -1712,7 +1765,10 @@ function bisaKelola() { return peranKu() === 'pemilik'; }
 /* Identitas karyawan (id, nama, komisi) dari kode yang dipasang; kosong untuk pemilik */
 function aku() { return peranKu() !== 'pemilik' && typeof window.__lokal.aku === 'function' ? window.__lokal.aku() : null; }
 function tersambung() { return !!(window.__lokal && typeof window.__lokal.status === 'function' && window.__lokal.status()); }
-function tabsAktif() { return isSales() ? TAB_SALES : TABS; }
+/* Menu Log hanya ada di versi mandiri (data log ada di tab "jejak" di Google Sheet), dan tidak untuk sales */
+/* Menu Log hanya muncul kalau HP ini tersambung ke Google Sheet; log disimpan di Sheet, bukan di HP. */
+function adaLog() { return !!(window.__lokal && typeof window.__lokal.log === 'function' && tersambung()); }
+function tabsAktif() { return isSales() ? TAB_SALES : TABS.filter(function (t) { return t.key !== 'log' || adaLog(); }); }
 var GRAFIK = [{ key: 'hari', label: 'Harian' }, { key: 'minggu', label: 'Mingguan' }, { key: 'bulan', label: 'Bulanan' }];
 var S = {
   tab: 'beranda',
@@ -1723,7 +1779,11 @@ var S = {
   loaded: {},
   db: null, user: null, dl: null,
   noDb: false, canWrite: null, denied: false, slow: false, dbError: null,
-  today: localToday(), model: null, after: [], unsubs: [], hasXlsx: false
+  today: localToday(), model: null, after: [], unsubs: [], hasXlsx: false,
+  /* Pencarian menu Warung dan batas tampil daftar panjang (dimuat bertahap supaya layar tetap ringan) */
+  cari: { q: '', f: 'semua', lim: 20, fokus: false, sel: 0 },
+  lim: {},
+  log: { f: { dari: '', sampai: '', siapa: '' }, ap: { dari: '', sampai: '', siapa: '', jam: 24 }, win: null, buka: false, items: [], ringkas: [], total: 0, lanjut: 0, loading: false, err: '', lama: false, at: 0, termuat: false, tok: 0, edit: false }
 };
 if (!PERIODE.some(function (p) { return p.key === S.periode; })) S.periode = 'bulan';
 if (!GRAFIK.some(function (p) { return p.key === S.grafik; })) S.grafik = 'hari';
@@ -2026,55 +2086,69 @@ function drawChart(host, series) {
   }
 }
 
-/* ---- Daftar warung di beranda ---- */
+/* ---- Warung di beranda: ringkas saja. Daftar lengkap, pencarian, dan ubah identitas ada di menu Warung ---- */
 function feeShort(w) {
   var f = warungFee(w);
   return rp(f.f3) + ' per pcs' + ((S.model.hasKelas5 || f.f5 > 0) ? ' (Rp5.000: ' + rp(f.f5) + ')' : '');
+}
+var BERANDA_PERHATIAN = 5;
+function warungBaris(w, muted) {
+  var m = S.model;
+  var st = m.wStats[w.id];
+  var a = st.aktif;
+  var lama = a && a.hari > 7;
+  var badge = muted ? null
+    : a ? (lama ? pill('warn', '!', 'Sudah ' + a.hari + ' hari') : pill('info', '●', 'Ada rencengan'))
+    : pill('flat', '○', 'Kosong');
+  var line1 = a
+    ? st.renc + ' rencengan di warung · ' + (st.aktifList.length > 1 ? 'lebih dari satu batch' : a.batchLabel)
+    : (st.last ? 'Rencengan terakhir diambil ' + relDays(st.last, S.today) : 'Belum pernah menitip');
+  var main = h('div', { class: 'row-main' },
+    h('div', { class: 'row-t' }, w.nama, ' ', badge),
+    h('div', { class: 'row-s' }, line1 + (a ? ' · sejak ' + fmtDay(a.tanggalTitip) : '')),
+    st.piutang > 0 ? h('div', { class: 'row-s' }, h('b', { style: 'color:var(--ink)' }, 'Belum setor ' + rp(st.piutang))) : null);
+  var right = h('div', { class: 'row-r' }, h('b', null, fmtNum(st.stok) + ' pcs'), h('small', null, 'di warung'));
+  var tap = a ? function () { openAmbil({ id: a.id }); } : function () { openTitip({ warungId: w.id }); };
+  var label = (a ? 'Ambil rencengan di ' : 'Titip rencengan di ') + w.nama;
+  var open = canW() && !muted ? h('button', { type: 'button', class: 'row', style: 'flex:1 1 auto;border-bottom:0', 'aria-label': label, onclick: tap }, main, right)
+    : h('div', { class: 'row', style: 'flex:1 1 auto;border-bottom:0' }, main, right);
+  return h('div', { style: 'display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--line)' }, open);
 }
 function warungCard() {
   var m = S.model;
   var card = h('section', { class: 'card', 'aria-label': 'Daftar warung' });
   var aktif = m.warung.filter(function (w) { return w.status !== 'nonaktif'; });
-  var non = m.warung.filter(function (w) { return w.status === 'nonaktif'; });
+  var ada = 0, perhatian = [];
+  aktif.forEach(function (w) {
+    var st = m.wStats[w.id];
+    if (st.aktif) ada += 1;
+    if ((st.aktif && st.aktif.hari > 7) || st.piutang > 0) perhatian.push(w);
+  });
+  // Yang paling lama di warung dulu, lalu yang paling banyak belum disetor
+  perhatian.sort(function (a, b) {
+    var sa = m.wStats[a.id], sb = m.wStats[b.id];
+    var ha = sa.aktif ? sa.aktif.hari : -1, hb = sb.aktif ? sb.aktif.hari : -1;
+    if (hb !== ha) return hb - ha;
+    return sb.piutang - sa.piutang;
+  });
   card.appendChild(h('div', { class: 'sec-row' },
     h('div', null, h('div', { class: 'card-title' }, 'Warung (' + aktif.length + ')'),
-      h('div', { class: 'card-sub' }, 'Ketuk warung untuk menitip atau mengambil rencengan')),
+      h('div', { class: 'card-sub' }, m.warung.length ? ada + ' ada rencengan · ' + (aktif.length - ada) + ' kosong' : 'Belum ada warung')),
     canW() ? h('button', { type: 'button', class: 'btn sm', onclick: function () { openWarung(); } }, '+ Tambah') : null));
   if (!m.warung.length) {
     card.appendChild(h('div', { class: 'empty' }, h('b', null, 'Belum ada warung'), h('span', null, 'Tambahkan warung pertama untuk mulai mencatat.')));
     return card;
   }
-  var list = h('div', { class: 'list', style: 'margin-top:6px' });
-  function rowFor(w, muted) {
-    var st = m.wStats[w.id];
-    var a = st.aktif;
-    var lama = a && a.hari > 7;
-    var badge = muted ? null
-      : a ? (lama ? pill('warn', '!', 'Sudah ' + a.hari + ' hari') : pill('info', '●', 'Ada rencengan'))
-      : pill('flat', '○', 'Kosong');
-    var line1 = a
-      ? st.renc + ' rencengan di warung · ' + (st.aktifList.length > 1 ? 'lebih dari satu batch' : a.batchLabel)
-      : (st.last ? 'Rencengan terakhir diambil ' + relDays(st.last, S.today) : 'Belum pernah menitip');
-    var main = h('div', { class: 'row-main' },
-      h('div', { class: 'row-t' }, w.nama, ' ', badge),
-      h('div', { class: 'row-s' }, line1 + (a ? ' · sejak ' + fmtDay(a.tanggalTitip) : '')),
-      h('div', { class: 'row-s' }, 'Bagian warung ' + feeShort(w)),
-      st.piutang > 0 ? h('div', { class: 'row-s' }, h('b', { style: 'color:var(--ink)' }, 'Belum setor ' + rp(st.piutang))) : null);
-    var right = h('div', { class: 'row-r' }, h('b', null, fmtNum(st.stok) + ' pcs'), h('small', null, 'di warung'));
-    var tap = a ? function () { openAmbil({ id: a.id }); } : function () { openTitip({ warungId: w.id }); };
-    var label = (a ? 'Ambil rencengan di ' : 'Titip rencengan di ') + w.nama;
-    var open = canW() && !muted ? h('button', { type: 'button', class: 'row', style: 'flex:1 1 auto;border-bottom:0', 'aria-label': label, onclick: tap }, main, right)
-      : h('div', { class: 'row', style: 'flex:1 1 auto;border-bottom:0' }, main, right);
-    var line = h('div', { style: 'display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--line)' }, open,
-      canW() ? h('button', { type: 'button', class: 'btn ghost sm', 'aria-label': 'Ubah ' + w.nama, onclick: function () { openWarung(w); } }, 'Ubah') : null);
-    return line;
+  if (perhatian.length) {
+    card.appendChild(h('div', { class: 'card-sub', style: 'margin-top:10px' }, 'Perlu perhatian: rencengan lebih dari 7 hari di warung, atau belum disetor' + (perhatian.length > BERANDA_PERHATIAN ? ' (' + BERANDA_PERHATIAN + ' dari ' + perhatian.length + ')' : '')));
+    var list = h('div', { class: 'list', style: 'margin-top:4px' });
+    perhatian.slice(0, BERANDA_PERHATIAN).forEach(function (w) { list.appendChild(warungBaris(w, false)); });
+    card.appendChild(list);
+  } else {
+    card.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Tidak ada yang perlu perhatian sekarang.'));
   }
-  aktif.forEach(function (w) { list.appendChild(rowFor(w, false)); });
-  if (non.length) {
-    list.appendChild(h('div', { class: 'month-h' }, h('span', null, 'Berhenti menitip'), h('span', null, '')));
-    non.forEach(function (w) { list.appendChild(rowFor(w, true)); });
-  }
-  card.appendChild(list);
+  card.appendChild(h('div', { class: 'hero-actions' },
+    h('button', { type: 'button', class: 'btn', onclick: function () { goTab('warung'); } }, 'Lihat semua warung')));
   return card;
 }
 function viewBeranda() {
@@ -2369,87 +2443,335 @@ function adminOwnerCard() {
   return sec;
 }
 
-/* Kartu Aktivitas karyawan: jumlah perubahan per orang dan daftar perubahan terbaru dari tab "jejak" di Sheet */
+/* ===== Tab: Log (aktivitas karyawan) =====
+   Tidak memuat semuanya sekaligus: bawaannya hanya 24 jam terakhir, 50 aktivitas per halaman, dan sisanya
+   dimuat bertahap. Yang lebih lama dicari lewat filter tanggal, nama karyawan, atau keduanya. */
 var JEJAK_KOLEKSI = { hpp: 'Belanja', pengeluaran: 'Biaya', warung: 'Warung', titipan: 'Titipan', karyawan: 'Karyawan' };
 var JEJAK_AKSI = { tambah: 'menambah', ubah: 'mengubah', hapus: 'menghapus', ambil: 'mengambil rencengan di', 'batal-ambil': 'membatalkan pengambilan di' };
 var JEJAK_KOLEKSI_KECIL = { hpp: 'belanja', pengeluaran: 'biaya', warung: 'warung', titipan: 'titipan', karyawan: 'karyawan' };
-function jejakRentang(r) {
-  var dari = r[0] < '1970' ? 0 : new Date(r[0] + 'T00:00:00').getTime();
-  var sampai = r[1] > '2200' ? Date.now() + 86400000 : new Date(r[1] + 'T23:59:59').getTime() + 999;
-  return [dari || 0, sampai];
+var LOG_HALAMAN = 50;
+function pelakuLog(x) {
+  if (x.siapa === 'pemilik') return 'Owner';
+  var k = findBy(S.raw.karyawan || [], x.siapa);
+  return k && k.nama ? k.nama : (x.nama || 'karyawan lain');
 }
-function muatJejak(r, paksa) {
-  var L = window.__lokal;
-  var li = typeof L.info === 'function' ? L.info() : {};
-  // Ikut berubah tiap kali ada sinkron baru (perubahan dari HP mana pun), tetapi tidak lebih sering dari sekali per 3 detik
-  var key = S.periode + '|' + S.today + '|' + (li.lastTs || 0);
-  var J = S.jejak || (S.jejak = { key: '', at: 0, loading: false, err: '', data: null, tunggu: 0 });
-  if (J.loading) return;
-  if (!paksa) {
-    if (J.key === key) return;
-    var sisa = 3000 - (Date.now() - J.at);
-    if (sisa > 0) { if (!J.tunggu) J.tunggu = setTimeout(function () { J.tunggu = 0; schedule(); }, sisa + 50); return; }
-  }
-  J.loading = true; J.key = key; J.at = Date.now();
-  var t = jejakRentang(r);
-  L.jejak(t[0], t[1], 30).then(function (d) { J.data = d; J.err = ''; J.loading = false; J.at = Date.now(); schedule(); },
-    function (e) { J.err = (e && e.message) || 'Gagal memuat.'; J.loading = false; J.at = Date.now(); schedule(); });
+function jamRingkas(ts) {
+  var d = new Date(Number(ts) || 0);
+  return pad2(d.getHours()) + '.' + pad2(d.getMinutes());
 }
-function aktivitasCard(r) {
-  var L = window.__lokal;
-  if (!L || typeof L.jejak !== 'function' || isSales() || !tersambung()) return null;
-  muatJejak(r, false);
-  var J = S.jejak;
-  var sec = h('section', { class: 'card', 'aria-label': 'Aktivitas karyawan' });
-  sec.appendChild(h('div', { class: 'card-title' }, 'Aktivitas karyawan'));
-  sec.appendChild(h('div', { class: 'card-sub' }, 'Siapa mencatat dan mengubah data. Periode: ' + rangeLabel(S.periode, r[0], r[1], S.model.firstDate) + '. Perubahan sebelum versi 4 dan yang diketik langsung di Sheet tidak tercatat atas nama siapa pun.'));
-  var reload = h('button', { type: 'button', class: 'btn sm', disabled: J.loading, onclick: function () { muatJejak(r, true); schedule(); } }, J.loading ? 'Memuat…' : 'Muat ulang');
-  if (J.err) sec.appendChild(h('div', { class: 'errbox', role: 'alert', style: 'margin-top:10px' }, 'Aktivitas belum bisa dimuat. ' + J.err));
-  if (!J.data) {
-    if (!J.err) sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Memuat aktivitas' ));
-    sec.appendChild(h('div', { class: 'hero-actions' }, reload));
-    return sec;
-  }
-  // Ringkasan per orang
-  var orang = {}, urut = [];
-  J.data.ringkas.forEach(function (x) {
-    var o = orang[x.siapa];
-    if (!o) { o = orang[x.siapa] = { siapa: x.siapa, nama: x.nama, total: 0, c: {} }; urut.push(o); }
-    o.total += x.n; o.c[x.c] = (o.c[x.c] || 0) + x.n;
+/* Filter yang sedang dipakai -> rentang waktu untuk server. Tanpa filter apa pun = 24 jam terakhir.
+   Hanya nama karyawan = semua waktu untuk orang itu. */
+function tglLokal(ymd, plusHari) {
+  var p = ymd.split('-');
+  return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]) + plusHari).getTime();
+}
+/* Filter yang sedang dipakai -> rentang waktu untuk server.
+   ap.jam = 24: 24 jam terakhir (bawaan, boleh digabung dengan nama). Tanpa jam dan tanpa tanggal, hanya nama = semua waktu orang itu. */
+function logParam(ap) {
+  var now = Date.now();
+  if (ap.jam) return { dari: now - ap.jam * 3600000, sampai: now + 60000, label: ap.jam + ' jam terakhir' };
+  var dari = isYMD(ap.dari) ? tglLokal(ap.dari, 0) : 0;
+  var sampai = isYMD(ap.sampai) ? tglLokal(ap.sampai, 1) : now + 60000;
+  var label;
+  if (ap.dari && ap.sampai) label = ap.dari === ap.sampai ? fmtDate(ap.dari) : fmtDate(ap.dari) + ' sampai ' + fmtDate(ap.sampai);
+  else if (ap.dari) label = 'Sejak ' + fmtDate(ap.dari);
+  else if (ap.sampai) label = 'Sampai ' + fmtDate(ap.sampai);
+  else label = 'Semua waktu';
+  return { dari: dari, sampai: sampai, label: label };
+}
+function namaKaryawanLog(siapa) {
+  if (!siapa) return '';
+  if (siapa === 'pemilik') return 'Owner';
+  var k = findBy(S.raw.karyawan || [], siapa);
+  return k && k.nama ? k.nama : 'karyawan lain';
+}
+function muatLog(lagi) {
+  var L = S.log, API = window.__lokal;
+  if (!API || typeof API.log !== 'function') return;
+  if (!lagi) { L.tok += 1; L.loading = false; L.termuat = false; L.win = logParam(L.ap); }
+  if (L.loading) return;
+  var P = L.win || (L.win = logParam(L.ap)), tok = L.tok; // jendela waktu dikunci selama halaman-halamannya dimuat
+  L.loading = true; L.err = '';
+  API.log({ dari: P.dari, sampai: P.sampai, siapa: L.ap.siapa, n: LOG_HALAMAN, sebelum: lagi ? L.lanjut : 0 }).then(function (d) {
+    if (tok !== L.tok) return;
+    if (lagi) {
+      var ada = {};
+      L.items.forEach(function (x) { ada[x.b + '|' + x.t] = 1; });
+      d.items.forEach(function (x) { if (!ada[x.b + '|' + x.t]) L.items.push(x); });
+    } else { L.items = d.items; L.ringkas = d.ringkas; L.total = d.total; }
+    L.lanjut = d.lanjut; L.lama = d.lama; L.termuat = true; L.loading = false; L.at = Date.now();
+    schedule();
+  }, function (e) {
+    if (tok !== L.tok) return;
+    L.err = (e && e.message) || 'Gagal memuat.'; L.termuat = true; L.loading = false;
+    schedule();
   });
-  urut.sort(function (a, b) { return b.total - a.total; });
-  if (!urut.length) {
-    sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Belum ada perubahan tercatat di periode ini.'));
-  } else {
-    var rows = h('div', { class: 'list', style: 'margin-top:6px' });
-    urut.forEach(function (o) {
-      var bagian = ['hpp', 'pengeluaran', 'warung', 'titipan', 'karyawan'].filter(function (c) { return o.c[c]; })
-        .map(function (c) { return JEJAK_KOLEKSI[c] + ' ' + o.c[c]; }).join(' · ');
-      rows.appendChild(h('div', { class: 'row' },
-        h('div', { class: 'row-main' }, h('div', { class: 'row-t' }, namaPelaku(o.siapa) || o.nama), h('div', { class: 'row-s' }, bagian)),
-        h('div', { class: 'row-r' }, h('b', null, fmtNum(o.total)), h('small', null, 'perubahan'))));
-    });
-    sec.appendChild(rows);
+}
+function terapkanLog(ap) {
+  var L = S.log;
+  L.ap = { dari: ap.dari || '', sampai: ap.sampai || '', siapa: ap.siapa || '', jam: ap.jam || 0 };
+  L.f = { dari: L.ap.dari, sampai: L.ap.sampai, siapa: L.ap.siapa };
+  L.items = []; L.ringkas = []; L.total = 0; L.lanjut = 0; L.lama = false;
+  muatLog(false);
+  render();
+}
+function logTersaring(ap) { return !!(ap.dari || ap.sampai || ap.siapa); }
+function viewLog() {
+  var L = S.log, API = window.__lokal;
+  var box = h('div', { class: 'stack' });
+  if (!API || typeof API.log !== 'function') return box;
+  if (!tersambung()) {
+    box.appendChild(h('section', { class: 'card', 'aria-label': 'Log aktivitas' },
+      h('div', { class: 'card-title' }, 'Log aktivitas'),
+      h('p', { class: 'note', style: 'margin-top:6px' }, 'Log mencatat siapa mengubah apa. Log hanya tersedia kalau HP ini sudah tersambung ke Google Sheet. Hubungkan lewat kartu “Sinkron antar HP” di menu Laporan.'),
+      h('div', { class: 'hero-actions' }, h('button', { type: 'button', class: 'btn primary', onclick: function () { goTab('laporan'); } }, 'Buka Laporan'))));
+    return box;
   }
-  // Perubahan terbaru
-  if (J.data.terbaru.length) {
-    sec.appendChild(h('h3', { style: 'margin:14px 0 2px' }, J.data.terbaru.length + ' perubahan terbaru'));
-    var l2 = h('div', { class: 'list' });
-    J.data.terbaru.forEach(function (x) {
+  if (!L.termuat && !L.loading) muatLog(false);
+  var P = logParam(L.ap);
+
+  // ---- Filter: rentang cepat selalu terlihat, tanggal dan nama karyawan di panel yang bisa dibuka ----
+  var fc = h('section', { class: 'card', 'aria-label': 'Filter log' });
+  var tersaring = logTersaring(L.ap);
+  fc.appendChild(h('div', { class: 'sec-row' },
+    h('div', null, h('div', { class: 'card-title' }, 'Log aktivitas'),
+      h('div', { class: 'card-sub' }, 'Siapa mencatat dan mengubah apa')),
+    h('button', { type: 'button', class: 'btn sm', 'aria-expanded': L.buka ? 'true' : 'false', 'aria-controls': 'logPanel', onclick: function () { L.buka = !L.buka; render(); } },
+      L.buka ? 'Tutup filter' : (tersaring ? 'Filter (aktif)' : 'Filter'))));
+  var today = S.today;
+  var cepat = [
+    { key: '24j', label: '24 jam', ap: { dari: '', sampai: '', siapa: L.ap.siapa, jam: 24 } },
+    { key: '7h', label: '7 hari', ap: { dari: addDays(today, -6), sampai: today, siapa: L.ap.siapa } },
+    { key: '30h', label: '30 hari', ap: { dari: addDays(today, -29), sampai: today, siapa: L.ap.siapa } }
+  ];
+  var aktifCepat = L.ap.jam === 24 ? '24j'
+    : (L.ap.sampai === today && L.ap.dari === addDays(today, -6)) ? '7h'
+    : (L.ap.sampai === today && L.ap.dari === addDays(today, -29)) ? '30h' : '';
+  var chipRow = h('div', { class: 'chips', style: 'margin-top:10px', role: 'group', 'aria-label': 'Rentang cepat' });
+  cepat.forEach(function (c) {
+    chipRow.appendChild(h('button', { type: 'button', class: 'chip' + (c.key === aktifCepat ? ' on' : ''), 'aria-pressed': c.key === aktifCepat ? 'true' : 'false', onclick: function () { terapkanLog(c.ap); } }, c.label));
+  });
+  fc.appendChild(chipRow);
+  if (L.buka) {
+    var panel = h('div', { id: 'logPanel', style: 'margin-top:12px;padding-top:12px;border-top:1px solid var(--line)' });
+    var inDari = h('input', { type: 'date', class: 'inp', id: 'logDari', 'aria-label': 'Dari tanggal', value: L.f.dari, max: today });
+    var inSampai = h('input', { type: 'date', class: 'inp', id: 'logSampai', 'aria-label': 'Sampai tanggal', value: L.f.sampai, max: today });
+    var sel = h('select', { class: 'inp', id: 'logSiapa', 'aria-label': 'Nama karyawan' });
+    sel.appendChild(h('option', { value: '' }, 'Semua karyawan'));
+    sel.appendChild(h('option', { value: 'pemilik' }, 'Owner'));
+    cleanDocs('karyawan', S.raw.karyawan || []).slice().sort(function (a, b) { return String(a.nama).localeCompare(String(b.nama)); }).forEach(function (k) {
+      sel.appendChild(h('option', { value: k.id }, k.nama + ' (' + (k.peran === 'admin' ? 'admin' : 'sales') + ')' + (k.aktif === false ? ' · nonaktif' : '')));
+    });
+    sel.value = L.f.siapa;
+    if (sel.value !== L.f.siapa) sel.value = '';
+    [inDari, inSampai, sel].forEach(function (el) {
+      el.addEventListener('focus', function () { L.edit = true; });
+      el.addEventListener('blur', function () { L.edit = false; schedule(); });
+    });
+    inDari.addEventListener('input', function () { L.f.dari = inDari.value; });
+    inSampai.addEventListener('input', function () { L.f.sampai = inSampai.value; });
+    sel.addEventListener('change', function () { L.f.siapa = sel.value; });
+    panel.appendChild(h('p', { class: 'note', style: 'margin-bottom:10px' }, 'Untuk melihat yang lebih lama: pilih tanggal, nama karyawan, atau keduanya. Kalau hanya nama yang dipilih, yang tampil semua aktivitas orang itu.'));
+    panel.appendChild(h('div', { class: 'grid2 logtgl' },
+      h('div', { class: 'field' }, h('label', { for: 'logDari' }, 'Dari tanggal'), inDari),
+      h('div', { class: 'field' }, h('label', { for: 'logSampai' }, 'Sampai tanggal'), inSampai)));
+    panel.appendChild(h('div', { class: 'field', style: 'margin-top:10px' }, h('label', { for: 'logSiapa' }, 'Karyawan'), sel));
+    var err = h('div', { class: 'errbox', role: 'alert', hidden: true, style: 'margin-top:10px' });
+    panel.appendChild(err);
+    panel.appendChild(h('div', { class: 'hero-actions' },
+      h('button', { type: 'button', class: 'btn primary', onclick: function () {
+        var f = L.f;
+        if (f.dari && f.sampai && f.dari > f.sampai) { err.textContent = 'Tanggal “Dari” tidak boleh sesudah tanggal “Sampai”.'; err.hidden = false; return; }
+        err.hidden = true;
+        L.buka = false;
+        terapkanLog({ dari: f.dari, sampai: f.sampai, siapa: f.siapa, jam: (!f.dari && !f.sampai && !f.siapa) ? 24 : 0 });
+      } }, 'Terapkan'),
+      h('button', { type: 'button', class: 'btn', onclick: function () { L.buka = false; terapkanLog({ jam: 24 }); } }, 'Reset ke 24 jam terakhir')));
+    fc.appendChild(panel);
+  } else if (tersaring) {
+    fc.appendChild(h('div', { class: 'hero-actions', style: 'margin-top:10px' },
+      h('button', { type: 'button', class: 'btn sm', onclick: function () { terapkanLog({ jam: 24 }); } }, 'Reset ke 24 jam terakhir')));
+  }
+  box.appendChild(fc);
+
+  // ---- Hasil ----
+  var hc = h('section', { class: 'card', 'aria-label': 'Daftar aktivitas' });
+  var judul = P.label + (L.ap.siapa ? ' · ' + namaKaryawanLog(L.ap.siapa) : '');
+  hc.appendChild(h('div', { class: 'sec-row' },
+    h('div', null,
+      h('div', { class: 'card-title' }, judul),
+      h('div', { class: 'card-sub', role: 'status' }, L.loading && !L.items.length ? 'Memuat aktivitas…'
+        : L.err && !L.items.length ? 'Belum bisa dimuat'
+        : (L.lama ? 'Menampilkan ' + L.items.length + ' aktivitas terbaru' : fmtNum(L.total) + ' aktivitas') + (L.at ? ' · diperbarui ' + jamRingkas(L.at) : ''))),
+    h('button', { type: 'button', class: 'btn sm', disabled: L.loading, onclick: function () { muatLog(false); render(); } }, L.loading ? 'Memuat…' : 'Muat ulang')));
+  if (L.err) hc.appendChild(h('div', { class: 'errbox', role: 'alert', style: 'margin-top:10px' }, 'Aktivitas belum bisa dimuat. ' + L.err));
+  if (L.lama) hc.appendChild(alertBox('info', 'i', 'Skrip Apps Script di Google Sheet belum versi terbaru, jadi log hanya menampilkan 100 aktivitas terbaru dan belum bisa dimuat bertahap. Tempel skrip terbaru di Apps Script lalu Terapkan > Kelola penerapan > Versi baru.'));
+  if (L.ringkas.length && L.items.length) {
+    var rk = h('div', { class: 'chips', style: 'margin-top:10px', 'aria-label': 'Jumlah aktivitas per orang' });
+    L.ringkas.slice(0, 8).forEach(function (x) {
+      rk.appendChild(h('span', { class: 'tag' }, pelakuLog(x) + ' ' + fmtNum(x.n)));
+    });
+    hc.appendChild(rk);
+  }
+  if (L.termuat && !L.err && !L.items.length) {
+    hc.appendChild(h('div', { class: 'empty' }, h('b', null, 'Tidak ada aktivitas'),
+      h('span', null, L.ap.dari || L.ap.sampai || L.ap.siapa ? 'Tidak ada aktivitas yang cocok dengan filter ini.' : 'Tidak ada aktivitas dalam 24 jam terakhir. Pakai filter untuk melihat yang lebih lama.')));
+  } else if (L.items.length) {
+    var list = h('div', { class: 'list', style: 'margin-top:6px' });
+    var lastTg = '';
+    L.items.forEach(function (x) {
+      var tg = tglDariTs(x.t);
+      if (tg !== lastTg) { lastTg = tg; list.appendChild(h('div', { class: 'month-h' }, h('span', null, fmtDate(tg)), h('span', null, ''))); }
       var kata = JEJAK_AKSI[x.aksi] || x.aksi;
       var objek = JEJAK_KOLEKSI_KECIL[x.c] || x.c;
-      l2.appendChild(h('div', { class: 'row' },
+      list.appendChild(h('div', { class: 'row' },
         h('div', { class: 'row-main' },
-          h('div', { class: 'row-t' }, (namaPelaku(x.siapa) || x.nama) + ' ' + kata + ' ' + objek),
-          h('div', { class: 'row-s' }, x.r)),
-        h('div', { class: 'row-r' }, h('small', null, waktuRingkas(x.t)))));
+          h('div', { class: 'row-t' }, pelakuLog(x) + ' ' + kata + ' ' + objek),
+          h('div', { class: 'row-s clamp2' }, x.r)),
+        h('div', { class: 'row-r' }, h('small', null, jamRingkas(x.t)))));
     });
-    sec.appendChild(l2);
+    hc.appendChild(list);
+    if (L.lanjut > 0) {
+      hc.appendChild(h('div', { class: 'hero-actions' },
+        h('button', { type: 'button', class: 'btn', disabled: L.loading, onclick: function () { muatLog(true); render(); } }, L.loading ? 'Memuat…' : 'Tampilkan lebih lama')));
+    } else if (!L.lama) {
+      hc.appendChild(h('p', { class: 'note', style: 'margin-top:10px' }, 'Sudah semuanya untuk filter ini.'));
+    }
   }
-  sec.appendChild(h('div', { class: 'hero-actions' }, reload));
-  return sec;
+  box.appendChild(hc);
+  return box;
 }
 
+/* ===== Tab: Warung (daftar, cari, ubah identitas) =====
+   Kartu ringkas dengan teks dibatasi, daftar dimuat 20 per halaman, dan kotak cari nama, alamat, atau catatan,
+   supaya layar tetap ringan walau warungnya sudah ratusan atau ribuan. */
+var WARUNG_HALAMAN = 20;
+/* Satu pembanding dipakai berulang: jauh lebih cepat daripada localeCompare dengan pilihan di tiap perbandingan */
+var KOLASI_NAMA = (typeof Intl !== 'undefined' && Intl.Collator) ? new Intl.Collator('id', { numeric: true, sensitivity: 'base' }) : { compare: function (a, b) { return a < b ? -1 : a > b ? 1 : 0; } };
+var WARUNG_FILTER = [
+  { key: 'semua', label: 'Aktif' }, { key: 'ada', label: 'Ada rencengan' }, { key: 'piutang', label: 'Belum setor' }, { key: 'berhenti', label: 'Berhenti' }
+];
+function cariNorm(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+function warungKartu(w) {
+  var m = S.model, st = m.wStats[w.id], a = st.aktif, nonaktif = w.status === 'nonaktif';
+  var lama = a && a.hari > 7;
+  var badge = nonaktif ? pill('flat', '○', 'Berhenti')
+    : a ? (lama ? pill('warn', '!', 'Sudah ' + a.hari + ' hari') : pill('info', '●', 'Ada rencengan'))
+    : pill('flat', '○', 'Kosong');
+  var el = h('article', { class: 'wcard' + (nonaktif ? ' muted' : ''), 'aria-label': w.nama });
+  el.appendChild(h('div', { class: 'wc-top' }, h('div', { class: 'wc-t' }, w.nama), badge));
+  if (w.alamat) el.appendChild(h('div', { class: 'wc-s clamp1', title: w.alamat }, w.alamat));
+  if (w.catatan) el.appendChild(h('div', { class: 'wc-s clamp2', title: w.catatan }, 'Catatan: ' + w.catatan));
+  el.appendChild(h('div', { class: 'wc-s' }, a
+    ? st.renc + ' rencengan · sejak ' + fmtDay(a.tanggalTitip) + (a.hari > 0 ? ' (' + a.hari + ' hari)' : ' (hari ini)')
+    : (st.last ? 'Terakhir diambil ' + relDays(st.last, S.today) : 'Belum pernah menitip')));
+  el.appendChild(h('div', { class: 'wc-s' }, 'Bagian warung ' + feeShort(w), st.piutang > 0 ? ' · ' : null, st.piutang > 0 ? h('b', { style: 'color:var(--ink)' }, 'Belum setor ' + rp(st.piutang)) : null));
+  if (canW()) {
+    var act = h('div', { class: 'wc-act' });
+    act.appendChild(h('button', { type: 'button', class: 'btn sm', 'aria-label': 'Ubah ' + w.nama, onclick: function () { openWarung(w); } }, 'Ubah'));
+    if (!nonaktif) {
+      act.appendChild(a
+        ? h('button', { type: 'button', class: 'btn sm primary', 'aria-label': 'Ambil rencengan di ' + w.nama, onclick: function () { openAmbil({ id: a.id }); } }, 'Ambil rencengan')
+        : h('button', { type: 'button', class: 'btn sm primary', 'aria-label': 'Titip rencengan di ' + w.nama, onclick: function () { openTitip({ warungId: w.id }); } }, 'Titip rencengan'));
+    }
+    el.appendChild(act);
+  }
+  return el;
+}
+function viewWarung() {
+  var m = S.model, C = S.cari;
+  var box = h('div', { class: 'stack' });
+  var byNama = function (a, b) { return KOLASI_NAMA.compare(String(a.nama), String(b.nama)); };
+  var aktif = [], berhenti = [], ada = [], piutang = [];
+  m.warung.forEach(function (w) {
+    var st = m.wStats[w.id];
+    if (w.status === 'nonaktif') berhenti.push(w); else { aktif.push(w); if (st.aktif) ada.push(w); }
+    if (st.piutang > 0) piutang.push(w);
+  });
+  aktif.sort(byNama); berhenti.sort(byNama);
+  ada.sort(function (a, b) { return (m.wStats[b.id].aktif.hari - m.wStats[a.id].aktif.hari) || byNama(a, b); });
+  piutang.sort(function (a, b) { return (m.wStats[b.id].piutang - m.wStats[a.id].piutang) || byNama(a, b); });
+  var sets = { semua: aktif, ada: ada, piutang: piutang, berhenti: berhenti };
+  if (!sets[C.f]) C.f = 'semua';
+
+  var head = h('section', { class: 'card', 'aria-label': 'Cari warung' });
+  head.appendChild(h('div', { class: 'sec-row' },
+    h('div', null, h('div', { class: 'card-title' }, 'Warung (' + aktif.length + ')'),
+      h('div', { class: 'card-sub' }, berhenti.length ? aktif.length + ' aktif · ' + berhenti.length + ' berhenti menitip' : 'Cari, ubah identitas, atau titip dan ambil rencengan')),
+    canW() ? h('button', { type: 'button', class: 'btn sm', onclick: function () { openWarung(); } }, '+ Tambah') : null));
+  var inp = h('input', { type: 'search', id: 'cariWarung', class: 'inp cari', placeholder: 'Cari nama, alamat, catatan', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', maxlength: '80', 'aria-label': 'Cari warung berdasarkan nama, alamat, atau catatan', value: C.q });
+  head.appendChild(h('div', { style: 'margin-top:10px' }, inp));
+  var chipHost = h('div', { class: 'chips', style: 'margin-top:10px', role: 'group', 'aria-label': 'Saring daftar warung' });
+  WARUNG_FILTER.forEach(function (f) {
+    chipHost.appendChild(h('button', { type: 'button', class: 'chip' + (f.key === C.f ? ' on' : ''), 'aria-pressed': f.key === C.f ? 'true' : 'false',
+      onclick: function () { C.f = f.key; C.lim = WARUNG_HALAMAN; render(); } }, f.label + ' (' + sets[f.key].length + ')'));
+  });
+  head.appendChild(chipHost);
+  var cnt = h('div', { class: 'card-sub', role: 'status', 'aria-live': 'polite', style: 'margin-top:10px' });
+  head.appendChild(cnt);
+  box.appendChild(head);
+
+  var host = h('div', { class: 'stack' });
+  box.appendChild(host);
+  var hay = null; // teks cari dibuat sekali per tampilan, hanya kalau sedang mencari
+  function cocok(w, tokens) {
+    if (!hay) {
+      hay = {};
+      m.warung.forEach(function (x) { hay[x.id] = cariNorm((x.nama || '') + ' ' + (x.alamat || '') + ' ' + (x.catatan || '')); });
+    }
+    var t = hay[w.id] || '';
+    for (var i = 0; i < tokens.length; i++) if (t.indexOf(tokens[i]) < 0) return false;
+    return true;
+  }
+  function gambar() {
+    var tokens = cariNorm(C.q).split(' ').filter(Boolean);
+    var dasar = sets[C.f];
+    var hasil = tokens.length ? dasar.filter(function (w) { return cocok(w, tokens); }) : dasar;
+    var tampil = hasil.slice(0, C.lim);
+    host.textContent = '';
+    cnt.textContent = !m.warung.length ? 'Belum ada warung.'
+      : hasil.length ? 'Menampilkan ' + tampil.length + ' dari ' + hasil.length + ' warung' + (tokens.length ? ' yang cocok dengan “' + C.q.trim() + '”' : '')
+      : 'Tidak ada warung yang cocok.';
+    if (!m.warung.length) {
+      host.appendChild(h('section', { class: 'card' }, h('div', { class: 'empty' }, h('b', null, 'Belum ada warung'), h('span', null, 'Tambahkan warung pertama untuk mulai mencatat.'),
+        canW() ? h('button', { type: 'button', class: 'btn primary', onclick: function () { openWarung(); } }, '+ Tambah warung') : null)));
+      return;
+    }
+    if (!hasil.length) {
+      host.appendChild(h('section', { class: 'card' }, h('div', { class: 'empty' }, h('b', null, 'Tidak ada warung yang cocok'),
+        h('span', null, tokens.length ? 'Coba kata lain, atau cari lewat alamat atau catatan.' : 'Belum ada warung di kelompok ini.'),
+        tokens.length ? h('button', { type: 'button', class: 'btn', onclick: function () { C.q = ''; C.lim = WARUNG_HALAMAN; inp.value = ''; gambar(); inp.focus(); } }, 'Hapus pencarian') : null)));
+      return;
+    }
+    var grid = h('div', { class: 'wgrid' });
+    tampil.forEach(function (w) { grid.appendChild(warungKartu(w)); });
+    host.appendChild(grid);
+    if (hasil.length > tampil.length) {
+      var sisa = hasil.length - tampil.length;
+      host.appendChild(h('button', { type: 'button', class: 'btn block', onclick: function () { C.lim += WARUNG_HALAMAN; gambar(); } },
+        'Tampilkan ' + Math.min(WARUNG_HALAMAN, sisa) + ' lagi (sisa ' + sisa + ')'));
+    }
+  }
+  var tm = 0;
+  inp.addEventListener('input', function () {
+    C.q = inp.value; C.lim = WARUNG_HALAMAN;
+    clearTimeout(tm); tm = setTimeout(gambar, 120);
+  });
+  gambar();
+  S.after.push(function () {
+    if (C.fokus) { try { inp.focus(); inp.setSelectionRange(C.sel, C.sel); } catch (e) { /* abaikan */ } }
+  });
+  return box;
+}
+
+/* Daftar yang bisa panjang dimuat bertahap: tombol menambah batas tampil, lalu layar digambar ulang */
+var KUNJ_HALAMAN = 30;
+function tombolLagi(key, total, tampil) {
+  var sisa = total - tampil;
+  if (sisa <= 0) return null;
+  return h('button', { type: 'button', class: 'btn block', style: 'margin-top:10px', onclick: function () { S.lim[key] = (S.lim[key] || KUNJ_HALAMAN) + KUNJ_HALAMAN; render(); } },
+    'Tampilkan ' + Math.min(KUNJ_HALAMAN, sisa) + ' lagi (sisa ' + sisa + ')');
+}
 /* ===== Tab: Kunjungan (titip dan ambil rencengan) ===== */
 function viewKunjungan() {
   if (isSales()) return viewWarungSales();
@@ -2478,7 +2800,8 @@ function viewKunjungan() {
     : 'Belum ada rencengan yang dititip.'));
   if (m.aktif.length) {
     var al = h('div', { class: 'list', style: 'margin-top:6px' });
-    m.aktif.forEach(function (a) {
+    var limA = S.lim.aktif || KUNJ_HALAMAN;
+    m.aktif.slice(0, limA).forEach(function (a) {
       var lama = a.hari > 7;
       var main = h('div', { class: 'row-main' },
         h('div', { class: 'row-t' }, a.warungNama, ' ', lama ? pill('warn', '!', 'Sudah ' + a.hari + ' hari') : null),
@@ -2490,6 +2813,8 @@ function viewKunjungan() {
       else al.appendChild(h('div', { class: 'row' }, main, right));
     });
     ac.appendChild(al);
+    var lagiA = tombolLagi('aktif', m.aktif.length, Math.min(limA, m.aktif.length));
+    if (lagiA) ac.appendChild(lagiA);
     if (canW()) ac.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Perlu mengubah jumlah rencengan yang sudah dititip? Ubah lewat menu Ambil rencengan lama, lalu pilih “Ubah titipan”.'));
   }
   box.appendChild(ac);
@@ -2502,10 +2827,15 @@ function viewKunjungan() {
     return box;
   }
   var list = h('div', { class: 'list' });
+  var limR = S.lim.riwayat || KUNJ_HALAMAN, tampilR = 0;
   groupByMonth(m.pickups).forEach(function (g) {
+    if (tampilR >= limR) return;
+    // Judul bulan memakai seluruh data bulan itu, walau baris yang tampil baru sebagian
     var om = g.items.reduce(function (a, v) { return a + v.omzet; }, 0);
     list.appendChild(h('div', { class: 'month-h' }, h('span', null, monthTitle(g.key)), h('span', null, g.items.length + ' pengambilan · omzet ' + rp(om))));
     g.items.forEach(function (v) {
+      if (tampilR >= limR) return;
+      tampilR += 1;
       var main = h('div', { class: 'row-main' },
         h('div', { class: 'row-t' }, fmtDay(v.tanggal) + ' · ' + v.warungNama),
         h('div', { class: 'row-s' }, v.rencengan + ' rencengan · ' + v.batchLabel + ' ', v.noHpp ? pill('warn', '!', 'HPP belum ada') : null),
@@ -2518,6 +2848,8 @@ function viewKunjungan() {
     });
   });
   card.appendChild(list);
+  var lagiR = tombolLagi('riwayat', m.pickups.length, tampilR);
+  if (lagiR) card.appendChild(lagiR);
   box.appendChild(card);
   return box;
 }
@@ -2795,8 +3127,6 @@ function viewLaporan() {
   if (soc) box.appendChild(soc);
   var adc = adminOwnerCard();
   if (adc) box.appendChild(adc);
-  var akc = aktivitasCard(r);
-  if (akc) box.appendChild(akc);
   if (window.__lokal && typeof window.__lokal.card === 'function') box.appendChild(window.__lokal.card(h, toast, fmtDate));
   return box;
 }
@@ -3916,13 +4246,22 @@ function renderNotices() {
         h('span', null, h('b', null, 'Ini data contoh. '), 'Angka di bawah masih campuran dengan contoh. Hapus kalau sudah siap mencatat data asli.'), b)));
   }
 }
+var navTerakhir = '';
 function renderNav() {
   var nav = $('nav');
+  var sl = nav.scrollLeft;
   nav.textContent = '';
   tabsAktif().forEach(function (t) {
     var ic = sv('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' }, sv('path', { d: t.icon }));
     nav.appendChild(h('button', { type: 'button', 'aria-current': t.key === S.tab ? 'page' : null, onclick: function () { goTab(t.key); } }, ic, h('span', null, t.label)));
   });
+  // Tujuh menu bisa lebih lebar dari layar: menu yang aktif ditengahkan saat berpindah, dan posisi geser dijaga saat layar disegarkan.
+  if (nav.scrollWidth > nav.clientWidth + 1) {
+    var cur = nav.querySelector('[aria-current="page"]');
+    if (cur && navTerakhir !== S.tab) nav.scrollLeft = Math.max(0, cur.offsetLeft - (nav.clientWidth - cur.offsetWidth) / 2);
+    else nav.scrollLeft = sl;
+  }
+  navTerakhir = S.tab;
 }
 function renderSync() {
   var el = $('sync');
@@ -3938,11 +4277,15 @@ function renderSync() {
   el.lastChild.textContent = txt;
 }
 
-var VIEWS = { beranda: viewBeranda, kunjungan: viewKunjungan, belanja: viewBelanja, biaya: viewBiaya, laporan: viewLaporan, performa: viewPerforma };
+var VIEWS = { beranda: viewBeranda, kunjungan: viewKunjungan, warung: viewWarung, belanja: viewBelanja, biaya: viewBiaya, laporan: viewLaporan, log: viewLog, performa: viewPerforma };
 function render() {
   computeModel();
   // HP sales hanya punya menu Warung baru dan Performa; alamat menu lain diarahkan ke menu pertamanya
   if (!tabsAktif().some(function (t) { return t.key === S.tab; })) S.tab = tabsAktif()[0].key;
+  // Kotak cari warung tetap terfokus (dan kursornya tetap di tempat) walau layar digambar ulang
+  var ae = document.activeElement;
+  S.cari.fokus = !!(ae && ae.id === 'cariWarung' && S.tab === 'warung');
+  if (S.cari.fokus) { try { S.cari.sel = ae.selectionStart; } catch (e) { S.cari.sel = (S.cari.q || '').length; } }
   renderNav(); renderNotices(); renderSync();
   S.after = [];
   var node;
@@ -3955,8 +4298,17 @@ function render() {
   S.after.forEach(function (fn) { fn(); });
 }
 var rafId = 0;
+/* Saat orang sedang mengetik di kotak cari atau mengisi filter log, pembaruan dari sinkron ditahan dulu supaya
+   papan ketik dan pemilih tanggal tidak tertutup di tengah jalan; digambar begitu isian ditinggalkan. */
+function sedangMengisi() {
+  var ae = document.activeElement;
+  if (S.tab === 'warung') return !!(ae && ae.id === 'cariWarung');
+  if (S.tab === 'log') return !!S.log.edit;
+  return false;
+}
 function schedule() {
   if (rafId) return;
+  if (sedangMengisi()) { S.tunda = true; return; }
   rafId = requestAnimationFrame(function () { rafId = 0; render(); });
 }
 
@@ -3990,7 +4342,15 @@ function subscribe() {
 function init() {
   S.tab = tabFromHash();
   S.hasXlsx = typeof XLSX !== 'undefined';
-  window.addEventListener('hashchange', function () { S.tab = tabFromHash(); window.scrollTo(0, 0); render(); });
+  window.addEventListener('hashchange', function () {
+    S.tab = tabFromHash(); window.scrollTo(0, 0);
+    if (S.tab === 'log') { S.log.termuat = false; S.log.edit = false; S.log.buka = false; } // tiap kali menu Log dibuka, isinya dimuat ulang
+    render();
+  });
+  document.addEventListener('focusout', function () {
+    if (!S.tunda) return;
+    setTimeout(function () { if (S.tunda && !sedangMengisi()) { S.tunda = false; schedule(); } }, 0);
+  });
   var rt = 0;
   window.addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(function () { if (S.tab === 'beranda' && allLoaded() && !sheetState) render(); }, 160); });
   render();
