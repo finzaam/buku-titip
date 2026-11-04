@@ -492,10 +492,12 @@ button.bcard:hover { background: var(--surface-2); }
     if (api && typeof api.onStatus === 'function') api.onStatus();
   }
   function setState(s, d) { state = s; detail = d || ''; emit(); }
+  function peranDari(x) { return x === 'sales' ? 'sales' : (x === 'admin' ? 'admin' : 'pemilik'); }
+  function akuDari(a) { return { id: String(a.id), nama: String(a.nama || ''), komisi: Number(a.komisi) || 0 }; }
   function ambilPeran(res) {
-    if (!cfg || !res) return;
-    var p = res.peran === 'sales' ? 'sales' : 'pemilik';
-    var a = p === 'sales' && res.aku ? { id: String(res.aku.id), nama: String(res.aku.nama || ''), komisi: Number(res.aku.komisi) || 0 } : null;
+    if (!cfg || !res || !res.peran) return;
+    var p = peranDari(res.peran);
+    var a = p !== 'pemilik' && res.aku ? akuDari(res.aku) : null;
     if (cfg.peran !== p || sig(cfg.aku || null) !== sig(a)) { cfg.peran = p; cfg.aku = a; saveCfg(); emit(); }
   }
   function pending(c, id) { return outbox.some(function (o) { return o.c === c && o.id === id; }); }
@@ -589,6 +591,7 @@ button.bcard:hover { background: var(--surface-2); }
         // Sambungan pertama: data yang hanya ada di HP ini ikut dikirim ke Sheet
         var naik = [];
         COLL.forEach(function (c) {
+          if (c === 'karyawan' && cfg.peran !== 'pemilik') return; // admin tidak mengelola karyawan
           Object.keys(store[c]).forEach(function (id) {
             if (!serverKeys[c + '/' + id] && !pending(c, id)) naik.push({ c: c, id: id, op: 'set', data: store[c][id] });
           });
@@ -600,7 +603,7 @@ button.bcard:hover { background: var(--surface-2); }
       Object.keys(touched).forEach(notify);
       busy = false; failCount = 0; nextTry = 0; lastOk = Date.now();
       setState('ok');
-      if (ditolak && api && typeof api.onNotice === 'function') api.onNotice('Server menolak ' + ditolak + ' catatan. Kemungkinan nama warung sudah ada atau tidak diizinkan untuk sales.');
+      if (ditolak && api && typeof api.onNotice === 'function') api.onNotice('Server menolak ' + ditolak + ' catatan. Kemungkinan nama warung sudah ada atau perubahan itu tidak diizinkan untuk peranmu.');
       if (outbox.length || cfg.full) scheduleFlush(lagi ? 50 : 300);
     }, function (err) { busy = false; gagal(err); });
   }
@@ -627,8 +630,8 @@ button.bcard:hover { background: var(--surface-2); }
     if (!/^https:\/\/script\.google\.com\/.+\/exec$/.test(u)) return Promise.reject(new Error('Alamat web app harus diawali https://script.google.com/ dan berakhiran /exec.'));
     if (!k) return Promise.reject(new Error('Isi kode akses.'));
     return post({ a: 'ping' }, { u: u, k: k }).then(function (pr) {
-      cfg = { u: u, k: k, lastTs: 0, peran: pr.peran === 'sales' ? 'sales' : 'pemilik', aku: null };
-      if (cfg.peran === 'sales' && pr.aku) cfg.aku = { id: String(pr.aku.id), nama: String(pr.aku.nama || ''), komisi: Number(pr.aku.komisi) || 0 };
+      cfg = { u: u, k: k, lastTs: 0, peran: peranDari(pr.peran), aku: null };
+      if (cfg.peran !== 'pemilik' && pr.aku) cfg.aku = akuDari(pr.aku);
       outbox = []; saveOut(); saveCfg();
       failCount = 0; nextTry = 0; busy = false;
       setState('sync'); startLoop();
@@ -647,7 +650,7 @@ button.bcard:hover { background: var(--surface-2); }
   function tautanPasangUntuk(kode) { return cfg && kode ? location.origin + location.pathname + '#pasang=' + kodePasangUntuk(kode) : ''; }
   function kodePasang() { return cfg ? kodePasangUntuk(cfg.k) : ''; }
   function tautanPasang() { return cfg ? tautanPasangUntuk(cfg.k) : ''; }
-  function peran() { return cfg && cfg.peran === 'sales' ? 'sales' : 'pemilik'; }
+  function peran() { return cfg ? peranDari(cfg.peran) : 'pemilik'; }
   function aku() { return cfg && cfg.aku ? { id: cfg.aku.id, nama: cfg.aku.nama, komisi: cfg.aku.komisi } : null; }
   function bacaPasang(text) {
     try {
@@ -789,6 +792,7 @@ button.bcard:hover { background: var(--surface-2); }
     return out;
   }
   function applyBackup(data) {
+    if (cfg && cfg.peran !== 'pemilik') return false; // hanya pemilik yang boleh menimpa seluruh data
     lsSet(KEY + '.sebelum-pulih', JSON.stringify(store)); // jaring pengaman
     var prev = store;
     store = {};
@@ -910,7 +914,7 @@ button.bcard:hover { background: var(--surface-2); }
     return sec;
   }
 
-  function backupCard(h, toast, fmtDate) {
+  function backupCard(h, toast, fmtDate, tanpaPulih) {
     var sec = h('section', { class: 'card', 'aria-label': 'Cadangan data' });
     var n = counts(store), total = n.warung + n.hpp + n.titipan + n.pengeluaran;
     var terakhir = lsGet(KEY_TERAKHIR);
@@ -970,8 +974,8 @@ button.bcard:hover { background: var(--surface-2); }
     sec.appendChild(h('div', { class: 'card-sub' }, cfg
       ? 'Data juga tersimpan di Google Sheet. Cadangan file tetap berguna kalau data di Sheet terhapus atau salah edit.'
       : 'Data hanya tersimpan di HP ini, tidak ada di internet. Unduh cadangan berkala supaya aman kalau HP hilang, ganti HP, atau data browser terhapus.'));
-    sec.appendChild(h('div', { class: 'hero-actions' }, bUnduh, bPulih));
-    sec.appendChild(input);
+    sec.appendChild(h('div', { class: 'hero-actions' }, bUnduh, tanpaPulih ? null : bPulih));
+    if (!tanpaPulih) sec.appendChild(input);
     sec.appendChild(stat);
     sec.appendChild(confirmBox);
     return sec;
@@ -979,6 +983,7 @@ button.bcard:hover { background: var(--surface-2); }
 
   function salesCard(h, toast) {
     var sec = h('section', { class: 'card', 'aria-label': 'Sinkron data' });
+    var adm = cfg && cfg.peran === 'admin';
     sec.appendChild(h('div', { class: 'card-title' }, 'Sinkron data'));
     var st = status();
     var teks = st ? st.text : 'Belum tersambung';
@@ -987,7 +992,10 @@ button.bcard:hover { background: var(--surface-2); }
     if (detail && state !== 'ok') line.appendChild(document.createTextNode('. ' + detail));
     if (outbox.length) line.appendChild(document.createTextNode('. ' + outbox.length + ' perubahan menunggu dikirim.'));
     sec.appendChild(line);
-    sec.appendChild(h('div', { class: 'card-sub' }, 'Terhubung sebagai sales. Catatanmu dikirim otomatis ke pemilik. Tanpa sinyal, catatan antre dan terkirim saat online. Menukar rencengan dikerjakan admin atau pemilik.'));
+    var siapa = cfg && cfg.aku && cfg.aku.nama ? ' (' + cfg.aku.nama + ')' : '';
+    sec.appendChild(h('div', { class: 'card-sub' }, adm
+      ? 'Terhubung sebagai admin' + siapa + '. Setiap catatan yang kamu simpan atau ubah tercatat atas namamu di Google Sheet. Tanpa sinyal, catatan antre dan terkirim saat online. Kode dan daftar karyawan hanya dikelola pemilik.'
+      : 'Terhubung sebagai sales' + siapa + '. Catatanmu dikirim otomatis ke pemilik. Tanpa sinyal, catatan antre dan terkirim saat online. Menukar rencengan dikerjakan admin atau pemilik.'));
     var bSync = h('button', { type: 'button', class: 'btn primary', onclick: function () {
       cfg.stop = false; saveCfg(); nextTry = 0; failCount = 0; startLoop();
       bSync.disabled = true; bSync.textContent = 'Menyinkronkan…';
@@ -1008,7 +1016,17 @@ button.bcard:hover { background: var(--surface-2); }
   }
 
   function card(h, toast, fmtDate) {
+    if (cfg && cfg.peran === 'admin') return h('div', { class: 'stack' }, salesCard(h, toast), backupCard(h, toast, fmtDate, true));
     return h('div', { class: 'stack' }, syncCard(h, toast), backupCard(h, toast, fmtDate));
+  }
+
+  /* Jejak perubahan (hanya pemilik dan admin): ringkasan per orang dan daftar terbaru */
+  function jejak(dari, sampai, n) {
+    if (!cfg || cfg.stop) return Promise.reject(new Error('Belum tersambung ke Google Sheet.'));
+    if (cfg.peran === 'sales') return Promise.reject(new Error('Tidak diizinkan.'));
+    return post({ a: 'jejak', dari: Number(dari) || 0, sampai: Number(sampai) || Date.now(), n: Number(n) || 30 }).then(function (res) {
+      return { ringkas: res.ringkas || [], terbaru: res.terbaru || [] };
+    }, function (err) { if (err && err.kode) gagal(err); throw err; });
   }
 
   window.addEventListener('storage', function (e) {
@@ -1021,7 +1039,7 @@ button.bcard:hover { background: var(--surface-2); }
   window.claude = { use: function (name) { return Promise.resolve(({ db: db, user: user, downloads: downloads })[name] || null); } };
   api = window.__lokal = {
     card: card, salesCard: salesCard, status: status, onStatus: null, onNotice: null,
-    peran: peran, aku: aku, kodePasangUntuk: kodePasangUntuk, tautanPasangUntuk: tautanPasangUntuk, salin: salin,
+    peran: peran, aku: aku, jejak: jejak, kodePasangUntuk: kodePasangUntuk, tautanPasangUntuk: tautanPasangUntuk, salin: salin,
     exportJson: exportJson, parseBackup: parseBackup, applyBackup: applyBackup,
     sambungkan: sambungkan, putuskan: putuskan, syncNow: syncOnce, kodePasang: kodePasang, bacaPasang: bacaPasang,
     setPoll: function (ms) { pollMs = ms; startLoop(); },
@@ -1470,8 +1488,14 @@ var TAB_SALES = [
   { key: 'kunjungan', label: 'Warung baru', icon: TABS[1].icon },
   { key: 'performa', label: 'Performa', icon: TABS[4].icon }
 ];
-function isSales() { return !!(window.__lokal && typeof window.__lokal.peran === 'function' && window.__lokal.peran() === 'sales'); }
-function aku() { return isSales() && typeof window.__lokal.aku === 'function' ? window.__lokal.aku() : null; }
+function peranKu() { return window.__lokal && typeof window.__lokal.peran === 'function' ? window.__lokal.peran() : 'pemilik'; }
+function isSales() { return peranKu() === 'sales'; }
+function isAdmin() { return peranKu() === 'admin'; }
+/* Hanya pemilik yang mengelola karyawan dan kode. Admin melihat semua angka tetapi tidak bisa mengubah karyawan. */
+function bisaKelola() { return peranKu() === 'pemilik'; }
+/* Identitas karyawan (id, nama, komisi) dari kode yang dipasang; kosong untuk pemilik */
+function aku() { return peranKu() !== 'pemilik' && typeof window.__lokal.aku === 'function' ? window.__lokal.aku() : null; }
+function tersambung() { return !!(window.__lokal && typeof window.__lokal.status === 'function' && window.__lokal.status()); }
 function tabsAktif() { return isSales() ? TAB_SALES : TABS; }
 var GRAFIK = [{ key: 'hari', label: 'Harian' }, { key: 'minggu', label: 'Mingguan' }, { key: 'bulan', label: 'Bulanan' }];
 var S = {
@@ -1885,7 +1909,8 @@ function batchCard(b, tap) {
       h('div', null,
         h('div', { class: 'bc-t' }, tag, ' ', 'Batch ' + b.nomor),
         h('div', { class: 'bc-s' }, fmtDate(b.tanggal) + ' · ' + fmtNum(b.pcs) + ' pcs · ' + rencText(b)),
-        h('div', { class: 'bc-s' }, 'Modal ' + rp(b.total) + ' · HPP ' + rp(b.perPcs) + ' per pcs' + (b.catatan ? ' · ' + b.catatan : ''))),
+        h('div', { class: 'bc-s' }, 'Modal ' + rp(b.total) + ' · HPP ' + rp(b.perPcs) + ' per pcs' + (b.catatan ? ' · ' + b.catatan : '')),
+        jejakBaris('hpp', b.id, 'bc-s')),
       batchPill(b)),
     stockBar(b),
     h('div', { class: 'bc-bot' },
@@ -1904,6 +1929,36 @@ function tglDariTs(ts) {
   var d = new Date(n);
   return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
 }
+/* ===== Jejak: siapa mencatat dan mengubah (v4) ===== */
+function namaPelaku(id) {
+  if (!id) return '';
+  if (id === 'pemilik') return 'Owner';
+  var k = findBy(S.raw.karyawan || [], id);
+  return k && k.nama ? k.nama : 'karyawan lain';
+}
+function waktuRingkas(ts) {
+  var n = Number(ts);
+  if (!isFinite(n) || n <= 0) return '';
+  var d = new Date(n);
+  return d.getDate() + ' ' + BULAN[d.getMonth()] + ' ' + pad2(d.getHours()) + '.' + pad2(d.getMinutes());
+}
+/* Teks "Dicatat Dewi · diubah terakhir Owner, 3 Nov 14.20". Kosong untuk sales dan untuk catatan sebelum v4. */
+function jejakTeks(coll, id) {
+  if (isSales() || !tersambung()) return '';
+  var d = findBy(S.raw[coll] || [], id);
+  if (!d || (!d.dibuatOleh && !d.diubahOleh)) return '';
+  var dibuat = namaPelaku(d.dibuatOleh), ubah = namaPelaku(d.diubahOleh), w = waktuRingkas(d.diubahPada);
+  if (!dibuat) return 'Terakhir diubah ' + ubah + (w ? ', ' + w : '');
+  var beda = d.diubahOleh && d.diubahOleh !== d.dibuatOleh;
+  var lama = num(d.dibuat) > 0 && num(d.diubahPada) - num(d.dibuat) > 600000;
+  if (beda || lama) return 'Dicatat ' + dibuat + ' · diubah terakhir ' + (ubah || dibuat) + (w ? ', ' + w : '');
+  return 'Dicatat ' + dibuat + (w ? ', ' + w : '');
+}
+function jejakBaris(coll, id, cls) {
+  var t = jejakTeks(coll, id);
+  return t ? h('div', { class: (cls || 'row-s') + ' jejak' }, t) : null;
+}
+
 /* Performa satu sales. Komisi dihitung saat toko yang ia daftarkan menerima rencengan pertama
    (tanggal titipan paling awal di toko itu, siapa pun yang menitipkan), sebesar nilai komisi
    yang dicatat saat toko didaftarkan. Toko yang belum menerima rencengan menunggu dan belum dihitung. */
@@ -2036,10 +2091,11 @@ function viewPerforma() {
 function salesOwnerCard(r) {
   var L = window.__lokal;
   if (!L || typeof L.kodePasangUntuk !== 'function' || isSales()) return null;
+  var kelola = bisaKelola() && canW();
   var sec = h('section', { class: 'card', 'aria-label': 'Sales dan komisi' });
   sec.appendChild(h('div', { class: 'card-title' }, 'Sales dan komisi'));
   sec.appendChild(h('div', { class: 'card-sub' }, 'Sales hanya mencari warung baru. Komisi dihitung saat toko yang ia daftarkan menerima rencengan pertama (siapa pun yang menitipkan), sebesar nilai komisi per toko. Periode: ' + rangeLabel(S.periode, r[0], r[1], S.model.firstDate) + '.'));
-  var list = cleanDocs('karyawan', S.raw.karyawan || []).slice().sort(function (a, b) { return String(a.nama).localeCompare(String(b.nama)); });
+  var list = cleanDocs('karyawan', S.raw.karyawan || []).filter(function (k) { return k.peran !== 'admin'; }).sort(function (a, b) { return String(a.nama).localeCompare(String(b.nama)); });
   if (!L.status()) sec.appendChild(alertBox('info', 'i', 'Hubungkan HP ini ke Google Sheet dulu (kartu “Sinkron antar HP” di bawah). Setelah itu sales bisa memasang aplikasi dengan kode pasangnya.'));
   if (list.length) {
     var tot = 0, rows = h('div', { class: 'list', style: 'margin-top:6px' });
@@ -2051,16 +2107,128 @@ function salesOwnerCard(r) {
         h('div', { class: 'row-s' }, st.baru.length + ' toko dihitung · ' + st.menunggu.length + ' menunggu rencengan pertama · ' + fmtNum(st.terjual) + ' pcs terjual · omzet ' + rp(st.omzet)),
         h('div', { class: 'row-s' }, 'Nilai komisi ' + rp(k.komisi) + ' per toko'));
       var right = h('div', { class: 'row-r' }, h('b', null, rp(st.komisi)), h('small', null, 'komisi'));
-      if (canW()) rows.appendChild(h('button', { type: 'button', class: 'row', 'aria-label': 'Ubah ' + k.nama, onclick: function () { openSales(k); } }, main, right));
+      if (kelola) rows.appendChild(h('button', { type: 'button', class: 'row', 'aria-label': 'Ubah ' + k.nama, onclick: function () { openSales(k, 'sales'); } }, main, right));
       else rows.appendChild(h('div', { class: 'row' }, main, right));
     });
     rows.appendChild(h('div', { class: 'row' }, h('div', { class: 'row-main' }, h('div', { class: 'row-t' }, 'Total komisi periode ini')), h('div', { class: 'row-r' }, h('b', null, rp(tot)))));
     sec.appendChild(rows);
     sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Hanya warung yang didaftarkan lewat HP sales yang dihitung. Kalau titipan pertama sebuah toko dihapus, toko itu kembali menunggu dan tidak dihitung. Komisi yang sudah kamu bayar, catat di menu Biaya (kategori Upah).'));
   } else {
-    sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Belum ada sales. Tambahkan sales, atur nilai komisi per toko baru, lalu kirim kode pasangnya.'));
+    sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, bisaKelola()
+      ? 'Belum ada sales. Tambahkan sales, atur nilai komisi per toko baru, lalu kirim kode pasangnya.'
+      : 'Belum ada sales. Pemilik yang menambahkan sales.'));
   }
-  if (canW()) sec.appendChild(h('div', { class: 'hero-actions' }, h('button', { type: 'button', class: 'btn primary', onclick: function () { openSales(null); } }, '+ Tambah sales')));
+  if (kelola) sec.appendChild(h('div', { class: 'hero-actions' }, h('button', { type: 'button', class: 'btn primary', onclick: function () { openSales(null, 'sales'); } }, '+ Tambah sales')));
+  else if (isAdmin()) sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Admin hanya melihat. Menambah atau mengubah sales dan kodenya dikerjakan pemilik.'));
+  return sec;
+}
+
+/* Kartu Admin: hanya pemilik yang menambah, mengubah, atau menonaktifkan admin dan kodenya */
+function adminOwnerCard() {
+  var L = window.__lokal;
+  if (!L || typeof L.kodePasangUntuk !== 'function' || !bisaKelola()) return null;
+  var sec = h('section', { class: 'card', 'aria-label': 'Admin' });
+  sec.appendChild(h('div', { class: 'card-title' }, 'Admin'));
+  sec.appendChild(h('div', { class: 'card-sub' }, 'Admin membantu mencatat belanja, biaya, dan menukar rencengan. Admin melihat semua angka, termasuk laba, tetapi tidak bisa mengelola karyawan atau kode. Tiap admin punya kode sendiri, dan setiap perubahan yang ia buat tercatat atas namanya.'));
+  var list = cleanDocs('karyawan', S.raw.karyawan || []).filter(function (k) { return k.peran === 'admin'; }).sort(function (a, b) { return String(a.nama).localeCompare(String(b.nama)); });
+  if (!L.status()) sec.appendChild(alertBox('info', 'i', 'Hubungkan HP ini ke Google Sheet dulu (kartu “Sinkron antar HP” di bawah). Setelah itu admin bisa memasang aplikasi dengan kode pasangnya.'));
+  if (list.length) {
+    var rows = h('div', { class: 'list', style: 'margin-top:6px' });
+    list.forEach(function (k) {
+      var nonaktif = k.aktif === false;
+      var main = h('div', { class: 'row-main' },
+        h('div', { class: 'row-t' }, k.nama, ' ', nonaktif ? pill('flat', '○', 'Nonaktif') : null),
+        h('div', { class: 'row-s' }, nonaktif ? 'Kodenya sudah tidak berlaku' : 'Kode pribadi aktif'));
+      var right = h('div', { class: 'row-r' }, pill(nonaktif ? 'flat' : 'good', nonaktif ? '○' : '✓', nonaktif ? 'Nonaktif' : 'Aktif'));
+      if (canW()) rows.appendChild(h('button', { type: 'button', class: 'row', 'aria-label': 'Ubah ' + k.nama, onclick: function () { openSales(k, 'admin'); } }, main, right));
+      else rows.appendChild(h('div', { class: 'row' }, main, right));
+    });
+    sec.appendChild(rows);
+  } else {
+    sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Belum ada admin. Tambahkan admin, lalu kirim kode pasangnya. Admin yang sebelumnya memakai kode pemilik sebaiknya dipindah ke kode pribadi, supaya perubahannya tercatat atas namanya.'));
+  }
+  if (canW()) sec.appendChild(h('div', { class: 'hero-actions' }, h('button', { type: 'button', class: 'btn primary', onclick: function () { openSales(null, 'admin'); } }, '+ Tambah admin')));
+  return sec;
+}
+
+/* Kartu Aktivitas karyawan: jumlah perubahan per orang dan daftar perubahan terbaru dari tab "jejak" di Sheet */
+var JEJAK_KOLEKSI = { hpp: 'Belanja', pengeluaran: 'Biaya', warung: 'Warung', titipan: 'Titipan', karyawan: 'Karyawan' };
+var JEJAK_AKSI = { tambah: 'menambah', ubah: 'mengubah', hapus: 'menghapus', ambil: 'mengambil rencengan di', 'batal-ambil': 'membatalkan pengambilan di' };
+var JEJAK_KOLEKSI_KECIL = { hpp: 'belanja', pengeluaran: 'biaya', warung: 'warung', titipan: 'titipan', karyawan: 'karyawan' };
+function jejakRentang(r) {
+  var dari = r[0] < '1970' ? 0 : new Date(r[0] + 'T00:00:00').getTime();
+  var sampai = r[1] > '2200' ? Date.now() + 86400000 : new Date(r[1] + 'T23:59:59').getTime() + 999;
+  return [dari || 0, sampai];
+}
+function muatJejak(r, paksa) {
+  var L = window.__lokal;
+  var li = typeof L.info === 'function' ? L.info() : {};
+  // Ikut berubah tiap kali ada sinkron baru (perubahan dari HP mana pun), tetapi tidak lebih sering dari sekali per 3 detik
+  var key = S.periode + '|' + S.today + '|' + (li.lastTs || 0);
+  var J = S.jejak || (S.jejak = { key: '', at: 0, loading: false, err: '', data: null, tunggu: 0 });
+  if (J.loading) return;
+  if (!paksa) {
+    if (J.key === key) return;
+    var sisa = 3000 - (Date.now() - J.at);
+    if (sisa > 0) { if (!J.tunggu) J.tunggu = setTimeout(function () { J.tunggu = 0; schedule(); }, sisa + 50); return; }
+  }
+  J.loading = true; J.key = key; J.at = Date.now();
+  var t = jejakRentang(r);
+  L.jejak(t[0], t[1], 30).then(function (d) { J.data = d; J.err = ''; J.loading = false; J.at = Date.now(); schedule(); },
+    function (e) { J.err = (e && e.message) || 'Gagal memuat.'; J.loading = false; J.at = Date.now(); schedule(); });
+}
+function aktivitasCard(r) {
+  var L = window.__lokal;
+  if (!L || typeof L.jejak !== 'function' || isSales() || !tersambung()) return null;
+  muatJejak(r, false);
+  var J = S.jejak;
+  var sec = h('section', { class: 'card', 'aria-label': 'Aktivitas karyawan' });
+  sec.appendChild(h('div', { class: 'card-title' }, 'Aktivitas karyawan'));
+  sec.appendChild(h('div', { class: 'card-sub' }, 'Siapa mencatat dan mengubah data. Periode: ' + rangeLabel(S.periode, r[0], r[1], S.model.firstDate) + '. Perubahan sebelum versi 4 dan yang diketik langsung di Sheet tidak tercatat atas nama siapa pun.'));
+  var reload = h('button', { type: 'button', class: 'btn sm', disabled: J.loading, onclick: function () { muatJejak(r, true); schedule(); } }, J.loading ? 'Memuat…' : 'Muat ulang');
+  if (J.err) sec.appendChild(h('div', { class: 'errbox', role: 'alert', style: 'margin-top:10px' }, 'Aktivitas belum bisa dimuat. ' + J.err));
+  if (!J.data) {
+    if (!J.err) sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Memuat aktivitas' ));
+    sec.appendChild(h('div', { class: 'hero-actions' }, reload));
+    return sec;
+  }
+  // Ringkasan per orang
+  var orang = {}, urut = [];
+  J.data.ringkas.forEach(function (x) {
+    var o = orang[x.siapa];
+    if (!o) { o = orang[x.siapa] = { siapa: x.siapa, nama: x.nama, total: 0, c: {} }; urut.push(o); }
+    o.total += x.n; o.c[x.c] = (o.c[x.c] || 0) + x.n;
+  });
+  urut.sort(function (a, b) { return b.total - a.total; });
+  if (!urut.length) {
+    sec.appendChild(h('p', { class: 'note', style: 'margin-top:8px' }, 'Belum ada perubahan tercatat di periode ini.'));
+  } else {
+    var rows = h('div', { class: 'list', style: 'margin-top:6px' });
+    urut.forEach(function (o) {
+      var bagian = ['hpp', 'pengeluaran', 'warung', 'titipan', 'karyawan'].filter(function (c) { return o.c[c]; })
+        .map(function (c) { return JEJAK_KOLEKSI[c] + ' ' + o.c[c]; }).join(' · ');
+      rows.appendChild(h('div', { class: 'row' },
+        h('div', { class: 'row-main' }, h('div', { class: 'row-t' }, namaPelaku(o.siapa) || o.nama), h('div', { class: 'row-s' }, bagian)),
+        h('div', { class: 'row-r' }, h('b', null, fmtNum(o.total)), h('small', null, 'perubahan'))));
+    });
+    sec.appendChild(rows);
+  }
+  // Perubahan terbaru
+  if (J.data.terbaru.length) {
+    sec.appendChild(h('h3', { style: 'margin:14px 0 2px' }, J.data.terbaru.length + ' perubahan terbaru'));
+    var l2 = h('div', { class: 'list' });
+    J.data.terbaru.forEach(function (x) {
+      var kata = JEJAK_AKSI[x.aksi] || x.aksi;
+      var objek = JEJAK_KOLEKSI_KECIL[x.c] || x.c;
+      l2.appendChild(h('div', { class: 'row' },
+        h('div', { class: 'row-main' },
+          h('div', { class: 'row-t' }, (namaPelaku(x.siapa) || x.nama) + ' ' + kata + ' ' + objek),
+          h('div', { class: 'row-s' }, x.r)),
+        h('div', { class: 'row-r' }, h('small', null, waktuRingkas(x.t)))));
+    });
+    sec.appendChild(l2);
+  }
+  sec.appendChild(h('div', { class: 'hero-actions' }, reload));
   return sec;
 }
 
@@ -2097,7 +2265,8 @@ function viewKunjungan() {
       var main = h('div', { class: 'row-main' },
         h('div', { class: 'row-t' }, a.warungNama, ' ', lama ? pill('warn', '!', 'Sudah ' + a.hari + ' hari') : null),
         h('div', { class: 'row-s' }, a.rencengan + ' rencengan · ' + a.batchLabel),
-        h('div', { class: 'row-s' }, 'Dititip ' + fmtDate(a.tanggalTitip) + (a.hari > 0 ? ' (' + a.hari + ' hari lalu)' : ' (hari ini)')));
+        h('div', { class: 'row-s' }, 'Dititip ' + fmtDate(a.tanggalTitip) + (a.hari > 0 ? ' (' + a.hari + ' hari lalu)' : ' (hari ini)')),
+        jejakBaris('titipan', a.id));
       var right = h('div', { class: 'row-r' }, h('b', null, fmtNum(a.pcs) + ' pcs'), h('small', null, 'nilai jual ' + rp(a.potensi)));
       if (canW()) al.appendChild(h('button', { type: 'button', class: 'row', 'aria-label': 'Ambil rencengan di ' + a.warungNama, onclick: function () { openAmbil({ id: a.id }); } }, main, right));
       else al.appendChild(h('div', { class: 'row' }, main, right));
@@ -2122,7 +2291,8 @@ function viewKunjungan() {
       var main = h('div', { class: 'row-main' },
         h('div', { class: 'row-t' }, fmtDay(v.tanggal) + ' · ' + v.warungNama),
         h('div', { class: 'row-s' }, v.rencengan + ' rencengan · ' + v.batchLabel + ' ', v.noHpp ? pill('warn', '!', 'HPP belum ada') : null),
-        h('div', { class: 'row-s' }, 'Terjual ' + v.terjual + ' dari ' + v.pcs + ' pcs · omzet ' + rp(v.omzet) + ' · laba kotor ' + rp(v.labaKotor)));
+        h('div', { class: 'row-s' }, 'Terjual ' + v.terjual + ' dari ' + v.pcs + ' pcs · omzet ' + rp(v.omzet) + ' · laba kotor ' + rp(v.labaKotor)),
+        jejakBaris('titipan', v.id));
       var right = h('div', { class: 'row-r' }, h('b', null, rp(v.setoran)),
         h('small', null, v.piutang > 0 ? 'Kurang ' + rp(v.piutang) : v.piutang < 0 ? 'Lebih ' + rp(-v.piutang) : 'Setoran pas'));
       if (canW()) list.appendChild(h('button', { type: 'button', class: 'row', onclick: function () { openAmbil({ edit: v }); } }, main, right));
@@ -2267,7 +2437,8 @@ function viewBiaya() {
     g.items.forEach(function (x) {
       var main = h('div', { class: 'row-main' },
         h('div', { class: 'row-t' }, h('span', { class: 'tag' }, x.kategori), x.ket || ''),
-        h('div', { class: 'row-s' }, fmtDate(x.tanggal)));
+        h('div', { class: 'row-s' }, fmtDate(x.tanggal)),
+        jejakBaris('pengeluaran', x.id));
       var right = h('div', { class: 'row-r' }, h('b', null, rp(x.jumlah)));
       if (canW()) list.appendChild(h('button', { type: 'button', class: 'row', onclick: function () { openBiaya({ edit: x }); } }, main, right));
       else list.appendChild(h('div', { class: 'row' }, main, right));
@@ -2401,6 +2572,10 @@ function viewLaporan() {
   // Hanya ada di versi mandiri (PWA) yang menyimpan data di HP
   var soc = salesOwnerCard(r);
   if (soc) box.appendChild(soc);
+  var adc = adminOwnerCard();
+  if (adc) box.appendChild(adc);
+  var akc = aktivitasCard(r);
+  if (akc) box.appendChild(akc);
   if (window.__lokal && typeof window.__lokal.card === 'function') box.appendChild(window.__lokal.card(h, toast, fmtDate));
   return box;
 }
@@ -2705,8 +2880,14 @@ function busy(btn, label) {
   btn.disabled = true; btn.textContent = label || 'Menyimpan…';
   return function () { btn.disabled = false; btn.textContent = old; };
 }
+/* Penanda yang dipegang server (siapa mendaftarkan, komisi yang dikunci, siapa mencatat). Form tidak mengisinya,
+   jadi saat sebuah catatan diedit penanda lamanya dibawa lagi supaya tampilan di HP ini tidak kehilangan data
+   sebelum sinkron berikutnya. Server tetap penentu akhir. */
+var PENANDA_SERVER = ['oleh', 'komisi', 'olehTitip', 'dibuatOleh', 'diubahOleh', 'diubahPada'];
 function persist(coll, id, data) {
   var ref = id ? S.db.doc(coll + '/' + id) : S.db.collection(coll).doc();
+  var prev = id && coll !== 'karyawan' ? findBy(S.raw[coll] || [], id) : null;
+  if (prev) PENANDA_SERVER.forEach(function (k) { if (data[k] === undefined && prev[k] !== undefined) data[k] = prev[k]; });
   return ref.set(data).then(function () {
     // Tampilan langsung ikut berubah tanpa menunggu kiriman data berikutnya
     var list = S.raw[coll] || (S.raw[coll] = []);
@@ -3279,6 +3460,7 @@ function openWarung(w, opts) {
     body.appendChild(fieldEl('Kontak', f.kontak));
     if (edit && !kar) body.appendChild(h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'Status'), statusHost));
     body.appendChild(fieldEl('Catatan', f.catatan));
+    if (edit) { var jt = jejakBaris('warung', edit.id, 'note'); if (jt) body.appendChild(jt); }
   }, function (foot, api) {
     if (edit && !hasVisits && !kar) deleteButton(foot, api, 'warung', edit.id, 'Warung dihapus.');
     foot.appendChild(h('button', { type: 'button', class: 'btn', onclick: api.close }, 'Batal'));
@@ -3311,7 +3493,7 @@ function openWarung(w, opts) {
   });
 }
 
-/* ===== Form: sales dan komisinya (hanya pemilik atau admin) ===== */
+/* ===== Form: karyawan (sales atau admin), hanya pemilik ===== */
 var KARAKTER_KODE = 'abcdefghjkmnpqrstuvwxyz23456789';
 function bikinKode() {
   var a = new Uint8Array(20), s = '';
@@ -3320,34 +3502,37 @@ function bikinKode() {
   for (var j = 0; j < a.length; j++) s += KARAKTER_KODE.charAt(a[j] % KARAKTER_KODE.length);
   return s;
 }
-function openSales(k) {
-  if (!canW() || isSales()) return;
+function openSales(k, peranBaru) {
+  if (!canW() || !bisaKelola()) return;
   var L = window.__lokal || {};
   var edit = k || null;
+  var adm = edit ? edit.peran === 'admin' : peranBaru === 'admin';
+  var sebut = adm ? 'admin' : 'sales';
   var aktif = !edit || edit.aktif !== false;
   var f = {
-    nama: h('input', { type: 'text', class: 'inp', maxlength: '60', placeholder: 'Nama sales' }),
+    nama: h('input', { type: 'text', class: 'inp', maxlength: '60', placeholder: 'Nama ' + sebut }),
     komisi: mkNum(edit ? num(edit.komisi) : null, 'contoh: 15000')
   };
   if (edit) f.nama.value = edit.nama;
   var statusHost = h('div');
   function drawStatus() {
     statusHost.textContent = '';
-    statusHost.appendChild(seg([{ key: 'ya', label: 'Aktif' }, { key: 'tidak', label: 'Nonaktif' }], aktif ? 'ya' : 'tidak', function (v) { aktif = v === 'ya'; drawStatus(); }, 'Status sales'));
+    statusHost.appendChild(seg([{ key: 'ya', label: 'Aktif' }, { key: 'tidak', label: 'Nonaktif' }], aktif ? 'ya' : 'tidak', function (v) { aktif = v === 'ya'; drawStatus(); }, 'Status ' + sebut));
   }
   drawStatus();
   var terhubung = !!(L.status && L.status());
-  openSheet(edit ? 'Ubah sales' : 'Tambah sales', function (body) {
+  openSheet((edit ? 'Ubah ' : 'Tambah ') + sebut, function (body) {
     body.appendChild(fieldEl('Nama', f.nama));
-    body.appendChild(fieldEl('Komisi per toko', moneyWrap(f.komisi), 'Dibayarkan untuk tiap warung yang didaftarkan sales ini dan sudah menerima rencengan pertama. Kalau nilainya diubah, hanya berlaku untuk warung yang didaftarkan sesudahnya. Warung yang sudah terdaftar tetap memakai nilai saat didaftarkan.', f.komisi));
-    if (!edit) { body.appendChild(h('p', { class: 'note' }, 'Setelah disimpan, kode pasang untuk sales ini muncul di layar berikutnya.')); return; }
-    body.appendChild(h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'Status'), statusHost, h('div', { class: 'hint' }, 'Sales nonaktif langsung tidak bisa masuk lagi.')));
-    var box = h('div', { class: 'box' }, h('h3', null, 'Kode pasang sales'));
+    if (!adm) body.appendChild(fieldEl('Komisi per toko', moneyWrap(f.komisi), 'Dibayarkan untuk tiap warung yang didaftarkan sales ini dan sudah menerima rencengan pertama. Kalau nilainya diubah, hanya berlaku untuk warung yang didaftarkan sesudahnya. Warung yang sudah terdaftar tetap memakai nilai saat didaftarkan.', f.komisi));
+    else body.appendChild(h('p', { class: 'note' }, 'Admin melihat semua angka, termasuk laba, dan boleh mencatat belanja, biaya, serta menukar rencengan. Admin tidak bisa mengelola karyawan atau kode. Setiap perubahan yang ia simpan tercatat atas namanya.'));
+    if (!edit) { body.appendChild(h('p', { class: 'note' }, 'Setelah disimpan, kode pasang untuk ' + sebut + ' ini muncul di layar berikutnya.')); return; }
+    body.appendChild(h('div', { class: 'field' }, h('span', { class: 'lbl' }, 'Status'), statusHost, h('div', { class: 'hint' }, (adm ? 'Admin' : 'Sales') + ' nonaktif langsung tidak bisa masuk lagi.')));
+    var box = h('div', { class: 'box' }, h('h3', null, 'Kode pasang ' + sebut));
     if (!terhubung) {
       box.appendChild(h('p', { class: 'note' }, 'HP ini belum tersambung ke Google Sheet. Hubungkan dulu lewat kartu “Sinkron antar HP” di menu Laporan, baru kode pasang bisa dibuat.'));
     } else {
-      box.appendChild(h('p', { class: 'note' }, 'Kirim lewat chat pribadi ke ' + edit.nama + '. Sales memasang aplikasi, membuka menu Laporan, lalu menempel kode ini di bagian “Admin atau sales”. Kode ini khusus untuknya, jangan dibagi ke orang lain.'));
-      var kodeInp = h('input', { type: 'text', class: 'inp', readonly: true, value: L.kodePasangUntuk(edit.kode), 'aria-label': 'Kode pasang sales' });
+      box.appendChild(h('p', { class: 'note' }, 'Kirim lewat chat pribadi ke ' + edit.nama + '. ' + (adm ? 'Admin' : 'Sales') + ' memasang aplikasi, membuka menu Laporan, lalu menempel kode ini di bagian “Admin atau sales”. Kode ini khusus untuknya, jangan dibagi ke orang lain.'));
+      var kodeInp = h('input', { type: 'text', class: 'inp', readonly: true, value: L.kodePasangUntuk(edit.kode), 'aria-label': 'Kode pasang ' + sebut });
       box.appendChild(h('div', { style: 'margin-top:8px' }, kodeInp));
       box.appendChild(h('div', { class: 'hero-actions' },
         h('button', { type: 'button', class: 'btn primary sm', onclick: function () { L.salin(L.kodePasangUntuk(edit.kode), toast, 'Kode pasang ' + edit.nama + ' disalin.', kodeInp); } }, 'Salin kode pasang'),
@@ -3360,10 +3545,10 @@ function openSales(k) {
         base.kode = bikinKode();
         persist('karyawan', edit.id, base).then(function () {
           closeSheet(); toast('Kode diganti. Kode lama langsung tidak berlaku, kirim kode pasang yang baru.');
-          openSales(findBy(S.raw.karyawan, edit.id));
+          openSales(findBy(S.raw.karyawan, edit.id), sebut);
         }, function (e) { armed = false; ganti.textContent = 'Ganti kode'; toast('Belum bisa mengganti kode. Coba lagi.'); });
       } }, 'Ganti kode');
-      box.appendChild(h('p', { class: 'note', style: 'margin-top:10px' }, 'Kalau kode bocor atau sales berhenti, ganti kode atau nonaktifkan.'));
+      box.appendChild(h('p', { class: 'note', style: 'margin-top:10px' }, 'Kalau kode bocor atau ' + sebut + ' berhenti, ganti kode atau nonaktifkan.'));
       box.appendChild(h('div', { style: 'margin-top:6px' }, ganti));
     }
     body.appendChild(box);
@@ -3372,20 +3557,21 @@ function openSales(k) {
     var save = h('button', { type: 'button', class: 'btn primary', onclick: function () {
       var err = [];
       var nm = f.nama.value.trim();
-      if (!nm) { err.push('Isi nama sales.'); markBad(f.nama, true); } else markBad(f.nama, false);
-      if (f.komisi.value === '') { err.push('Isi komisi per toko. Isi 0 kalau belum ada.'); markBad(f.komisi, true); } else markBad(f.komisi, false);
+      if (!nm) { err.push('Isi nama ' + sebut + '.'); markBad(f.nama, true); } else markBad(f.nama, false);
+      if (!adm) { if (f.komisi.value === '') { err.push('Isi komisi per toko. Isi 0 kalau belum ada.'); markBad(f.komisi, true); } else markBad(f.komisi, false); }
       if (err.length) { api.setErrors(err); return; }
       api.setErrors([]);
       var base = edit ? Object.assign({}, edit) : { kode: bikinKode(), catatan: '', dibuat: Date.now() };
       delete base.id;
-      var data = Object.assign(base, { nama: nm, komisi: ni(f.komisi), aktif: aktif });
+      var data = Object.assign(base, { nama: nm, komisi: adm ? 0 : ni(f.komisi), aktif: aktif });
+      if (adm) data.peran = 'admin';
       var done = busy(save);
       persist('karyawan', edit ? edit.id : null, data).then(function (id) {
         closeSheet();
-        if (edit) toast('Sales diperbarui.');
-        else { toast('Sales ditambahkan. Salin kode pasangnya untuk dikirim.'); openSales(findBy(S.raw.karyawan, id)); }
+        if (edit) toast((adm ? 'Admin' : 'Sales') + ' diperbarui.');
+        else { toast((adm ? 'Admin' : 'Sales') + ' ditambahkan. Salin kode pasangnya untuk dikirim.'); openSales(findBy(S.raw.karyawan, id), sebut); }
       }, function (e) { done(); writeFail(api, e); });
-    } }, edit ? 'Simpan perubahan' : 'Simpan sales');
+    } }, edit ? 'Simpan perubahan' : 'Simpan ' + sebut);
     foot.appendChild(save);
   });
 }

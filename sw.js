@@ -1,6 +1,6 @@
 /* Service worker: menyimpan berkas aplikasi di HP supaya bisa dibuka tanpa internet.
    Kalau kamu mengunggah versi baru, ubah angka VERSI di bawah supaya HP mengambil berkas baru. */
-var VERSI = 'v3b';
+var VERSI = 'v4';
 var CACHE = 'buku-titip-' + VERSI;
 var BERKAS = ['./', 'index.html', 'manifest.webmanifest', 'xlsx.full.min.js', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png'];
 
