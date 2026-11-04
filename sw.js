@@ -1,11 +1,21 @@
 /* Service worker: menyimpan berkas aplikasi di HP supaya bisa dibuka tanpa internet.
-   Kalau kamu mengunggah versi baru, ubah angka VERSI di bawah supaya HP mengambil berkas baru. */
-var VERSI = 'v4';
+   Kalau kamu mengunggah versi baru, ubah angka VERSI di bawah (dan angka APP_VERSI di lokal.js, harus sama)
+   supaya HP mengambil berkas baru. */
+var VERSI = 'v4b';
 var CACHE = 'buku-titip-' + VERSI;
 var BERKAS = ['./', 'index.html', 'manifest.webmanifest', 'xlsx.full.min.js', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', function (e) {
-  e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(BERKAS); }).then(function () { return self.skipWaiting(); }));
+  // Berkas diambil langsung dari server (melewati simpanan sementara browser dan GitHub Pages),
+  // supaya HP tidak ikut menyimpan versi lama yang masih "segar" di simpanan sementara itu.
+  e.waitUntil(caches.open(CACHE).then(function (c) {
+    return Promise.all(BERKAS.map(function (u) {
+      return fetch(new Request(u, { cache: 'reload' })).then(function (res) {
+        if (!res.ok) throw new Error('Gagal mengambil ' + u);
+        return c.put(u, res);
+      });
+    }));
+  }).then(function () { return self.skipWaiting(); }));
 });
 self.addEventListener('activate', function (e) {
   e.waitUntil(caches.keys().then(function (keys) {
@@ -17,9 +27,12 @@ self.addEventListener('fetch', function (e) {
   if (req.method !== 'GET') return;
   var url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+  if (/\/sw\.js$/.test(url.pathname)) return; // pemeriksaan versi memakai jaringan langsung
   e.respondWith(caches.open(CACHE).then(function (cache) {
     return cache.match(req, { ignoreSearch: true }).then(function (hit) {
-      var net = fetch(req).then(function (res) {
+      // Yang tampil dulu berkas simpanan (cepat dan jalan tanpa sinyal); di belakang layar berkas dicek ulang ke server
+      // dan simpanan diperbarui, jadi pembukaan berikutnya memakai versi terbaru.
+      var net = fetch(req, { cache: 'no-cache' }).then(function (res) {
         if (res && res.ok) cache.put(req, res.clone());
         return res;
       }).catch(function () {

@@ -417,6 +417,7 @@ button.bcard:hover { background: var(--surface-2); }
    - Kalau dihubungkan ke Google Sheet, setiap perubahan dikirim lewat antrean dan perubahan HP lain diambil tiap beberapa detik. */
 (function () {
   'use strict';
+  var APP_VERSI = 'v4b'; // harus sama dengan VERSI di sw.js (build_pwa.sh memeriksanya)
   var KEY = 'bukutitip.data.v1';
   var KEY_TERAKHIR = 'bukutitip.cadangan.terakhir';
   var KEY_CFG = 'bukutitip.sync.cfg';
@@ -579,11 +580,11 @@ button.bcard:hover { background: var(--surface-2); }
       var touched = terapkanDariServer(res.docs || [], serverKeys);
       var lagi = false;
       ambilPeran(res);
-      var ditolak = 0;
+      var ditolak = 0, isiAneh = 0;
       if (res.tolak && res.tolak.length) {
         // Server menolak sebagian catatan (misalnya nama warung sudah ada): buang dari HP ini dan tarik ulang semuanya
         res.tolak.forEach(function (x) {
-          if (store[x.c] && Object.prototype.hasOwnProperty.call(store[x.c], x.id) && !pending(x.c, x.id)) { delete store[x.c][x.id]; touched[x.c] = 1; ditolak++; }
+          if (store[x.c] && Object.prototype.hasOwnProperty.call(store[x.c], x.id) && !pending(x.c, x.id)) { delete store[x.c][x.id]; touched[x.c] = 1; ditolak++; if (x.why === 'isi') isiAneh++; }
         });
         cfg.full = true;
       } else { cfg.full = false; }
@@ -603,7 +604,9 @@ button.bcard:hover { background: var(--surface-2); }
       Object.keys(touched).forEach(notify);
       busy = false; failCount = 0; nextTry = 0; lastOk = Date.now();
       setState('ok');
-      if (ditolak && api && typeof api.onNotice === 'function') api.onNotice('Server menolak ' + ditolak + ' catatan. Kemungkinan nama warung sudah ada atau perubahan itu tidak diizinkan untuk peranmu.');
+      if (ditolak && api && typeof api.onNotice === 'function') api.onNotice(isiAneh
+        ? 'Server menolak ' + ditolak + ' catatan karena isinya tidak wajar atau terlalu besar (misalnya angka berisi huruf).'
+        : 'Server menolak ' + ditolak + ' catatan. Kemungkinan nama warung sudah ada atau perubahan itu tidak diizinkan untuk peranmu.');
       if (outbox.length || cfg.full) scheduleFlush(lagi ? 50 : 300);
     }, function (err) { busy = false; gagal(err); });
   }
@@ -906,11 +909,44 @@ button.bcard:hover { background: var(--surface-2); }
     sec.appendChild(h('div', { class: 'hero-actions' }, bSync, bSalin, bTaut));
     sec.appendChild(h('div', { class: 'box', style: 'margin-top:12px' },
       h('h3', null, 'Kode pasang pemilik atau admin'),
-      h('p', { class: 'note' }, 'Pakai kode ini untuk HP-mu yang lain atau untuk admin yang menukar rencengan. Pemegang kode ini melihat semua data, termasuk laba dan biaya. Untuk sales, buat kode terpisah per orang di bagian "Sales dan komisi" di bawah.'),
+      h('p', { class: 'note' }, 'Pakai kode ini untuk HP-mu yang lain atau untuk admin yang menukar rencengan. Pemegang kode ini melihat semua data, termasuk laba dan biaya. Untuk sales, buat kode terpisah per orang di bagian "Sales dan komisi" di atas.'),
       h('div', { style: 'margin-top:8px' }, kodeBox)));
     sec.appendChild(h('div', { class: 'hero-actions' }, bPut));
     sec.appendChild(err);
     if (state === 'kode') showErr('Kode akses salah atau sudah diganti pemilik. Putuskan sambungan lalu hubungkan lagi dengan kode terbaru.');
+    return sec;
+  }
+
+  /* Versi aplikasi di HP ini, perbandingan dengan versi di server, dan tombol memuat ulang aplikasi (data tidak disentuh) */
+  function perbaruiAplikasi() {
+    var tugas = [];
+    try { if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) tugas.push(navigator.serviceWorker.getRegistrations().then(function (rs) { return Promise.all(rs.map(function (r) { return r.unregister(); })); })); } catch (e) { /* abaikan */ }
+    try { if (window.caches && caches.keys) tugas.push(caches.keys().then(function (ks) { return Promise.all(ks.filter(function (k) { return k.indexOf('buku-titip-') === 0; }).map(function (k) { return caches.delete(k); })); })); } catch (e) { /* abaikan */ }
+    return Promise.all(tugas).catch(function () { /* tetap muat ulang */ }).then(function () {
+      location.replace(location.pathname + '?v=' + Date.now() + (location.hash || ''));
+    });
+  }
+  function versiCard(h, toast) {
+    var sec = h('section', { class: 'card', 'aria-label': 'Versi aplikasi' });
+    sec.appendChild(h('div', { class: 'card-title' }, 'Versi aplikasi'));
+    var info = h('p', { class: 'note', style: 'margin-top:10px' }, h('b', null, APP_VERSI));
+    var tail = document.createTextNode('');
+    info.appendChild(tail);
+    sec.appendChild(info);
+    var bUp = h('button', { type: 'button', class: 'btn', onclick: function () {
+      bUp.disabled = true; bUp.textContent = 'Memuat ulang…';
+      perbaruiAplikasi();
+    } }, 'Perbarui aplikasi');
+    sec.appendChild(h('div', { class: 'card-sub' }, 'Kalau perubahan terbaru belum tampil di HP ini, ketuk Perbarui aplikasi. Data kamu tidak terhapus, hanya berkas aplikasi yang diambil ulang.'));
+    sec.appendChild(h('div', { class: 'hero-actions' }, bUp));
+    if (/^https?:/.test(location.protocol) && typeof fetch === 'function') {
+      tail.nodeValue = ' · memeriksa versi terbaru…';
+      fetch('sw.js?cek=' + Date.now(), { cache: 'no-store' }).then(function (r) { return r.ok ? r.text() : Promise.reject(new Error('x')); }).then(function (t) {
+        var m = /VERSI\s*=\s*'([^']+)'/.exec(t);
+        if (!m) { tail.nodeValue = ''; return; }
+        tail.nodeValue = m[1] === APP_VERSI ? ' · sudah yang terbaru.' : ' · ada versi baru (' + m[1] + '). Ketuk Perbarui aplikasi.';
+      }, function () { tail.nodeValue = ' · belum bisa memeriksa versi terbaru (tanpa sinyal?).'; });
+    }
     return sec;
   }
 
@@ -1016,8 +1052,8 @@ button.bcard:hover { background: var(--surface-2); }
   }
 
   function card(h, toast, fmtDate) {
-    if (cfg && cfg.peran === 'admin') return h('div', { class: 'stack' }, salesCard(h, toast), backupCard(h, toast, fmtDate, true));
-    return h('div', { class: 'stack' }, syncCard(h, toast), backupCard(h, toast, fmtDate));
+    if (cfg && cfg.peran === 'admin') return h('div', { class: 'stack' }, salesCard(h, toast), backupCard(h, toast, fmtDate, true), versiCard(h, toast));
+    return h('div', { class: 'stack' }, syncCard(h, toast), backupCard(h, toast, fmtDate), versiCard(h, toast));
   }
 
   /* Jejak perubahan (hanya pemilik dan admin): ringkasan per orang dan daftar terbaru */
@@ -1036,9 +1072,21 @@ button.bcard:hover { background: var(--surface-2); }
   });
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {}); } catch (e) { /* abaikan */ }
 
+  // Versi baru aplikasi sudah terpasang di belakang layar (bukan pemasangan pertama): beri tahu pengguna
+  try {
+    if (navigator.serviceWorker) {
+      var adaPengendali = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.addEventListener('controllerchange', function () {
+        if (!adaPengendali) { adaPengendali = true; return; }
+        if (api && typeof api.onNotice === 'function') api.onNotice('Versi baru aplikasi sudah terpasang. Tutup lalu buka lagi aplikasinya, atau buka Laporan > Versi aplikasi > Perbarui aplikasi.');
+      });
+    }
+    if (/[?&]v=\d+/.test(location.search) && window.history && history.replaceState) history.replaceState(null, '', location.pathname + (location.hash || ''));
+  } catch (e) { /* abaikan */ }
+
   window.claude = { use: function (name) { return Promise.resolve(({ db: db, user: user, downloads: downloads })[name] || null); } };
   api = window.__lokal = {
-    card: card, salesCard: salesCard, status: status, onStatus: null, onNotice: null,
+    card: card, salesCard: salesCard, versiCard: versiCard, versi: APP_VERSI, status: status, onStatus: null, onNotice: null,
     peran: peran, aku: aku, jejak: jejak, kodePasangUntuk: kodePasangUntuk, tautanPasangUntuk: tautanPasangUntuk, salin: salin,
     exportJson: exportJson, parseBackup: parseBackup, applyBackup: applyBackup,
     sambungkan: sambungkan, putuskan: putuskan, syncNow: syncOnce, kodePasang: kodePasang, bacaPasang: bacaPasang,
@@ -2025,6 +2073,7 @@ function viewWarungSales() {
   box.appendChild(card);
   box.appendChild(h('p', { class: 'note' }, 'Komisi dihitung saat warung yang kamu daftarkan menerima rencengan pertama. Menukar atau mengambil rencengan, biaya, dan laporan dikerjakan admin atau pemilik.'));
   if (window.__lokal && typeof window.__lokal.salesCard === 'function') box.appendChild(window.__lokal.salesCard(h, toast));
+  if (window.__lokal && typeof window.__lokal.versiCard === 'function') box.appendChild(window.__lokal.versiCard(h, toast));
   return box;
 }
 function viewPerforma() {
@@ -3717,6 +3766,6 @@ function init() {
 init();
 })();
 </script>
-<script>if ('serviceWorker' in navigator && /^https?:/.test(location.protocol)) { window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js').catch(function () {}); }); }</script>
+<script>if ('serviceWorker' in navigator && /^https?:/.test(location.protocol)) { window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js').then(function (reg) { document.addEventListener('visibilitychange', function () { if (!document.hidden) reg.update().catch(function () {}); }); }).catch(function () {}); }); }</script>
 </body>
 </html>
